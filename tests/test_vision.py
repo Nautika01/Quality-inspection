@@ -41,7 +41,7 @@ def test_out_of_tolerance_dimensions_flagged():
     assert abs(res.concentricity_mm - 0.2) < 0.015
 
 
-def test_blank_image_is_ng_not_crash():
+def test_blank_image_is_error_not_ng():
     res = inspect_array(np.full((256, 256), 30, dtype=np.uint8), "S", SPEC)
-    assert res.verdict == "NG"
-    assert res.reasons[0].startswith("vision:")
+    assert res.verdict == "ERROR"
+    assert res.reasons == ["vision:part_not_found"]

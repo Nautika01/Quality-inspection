@@ -16,6 +16,9 @@ def test_guard_band_shrinks_acceptance():
     assert d.ok(12.097)
     assert not d.ok(12.097, guard_band=0.006)
     assert d.ok(12.093, guard_band=0.006)
+    assert SPEC.guard_band_for(SPEC.outer_diameter) == 0.008
+    assert SPEC.guard_band_for(SPEC.pocket_diameter) == 0.012
+    assert SPEC.guard_band_for(None) == SPEC.guard_band_mm
 
 
 def test_grading_thresholds():
@@ -39,7 +42,9 @@ def test_borderline_part_rejected_by_guard_band():
     # true OD 12.098 is inside the drawing tolerance but inside the guard band -> NG
     img = render_part(SPEC, np.random.default_rng(9), od_mm=12.098, pocket_mm=5.0)
     res = inspect_array(img, "S", SPEC)
-    assert "od_out_of_tolerance" in res.reasons
+    assert SPEC.outer_diameter.lsl <= res.od_mm <= SPEC.outer_diameter.usl  # measurement itself is in tolerance
+    assert res.od_mm > SPEC.outer_diameter.usl - SPEC.guard_band_for(SPEC.outer_diameter)
+    assert res.reasons == ["od_out_of_tolerance"]
 
 
 def test_gage_rr_anova_recovers_known_variances():

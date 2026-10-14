@@ -1,15 +1,27 @@
 services:
   api:
+    image: qinspect:0.3
     build: .
     ports: ["8000:8000"]
     volumes: ["qinspect-data:/data"]
     environment:
       QINSPECT_DB: /data/qinspect.db
+      QINSPECT_IMAGE_DIR: /data/evidence
+      # QINSPECT_API_KEY: change-me      # require X-API-Key on POST endpoints
+      # QINSPECT_SPEC: /data/spec.json
   dashboard:
+    image: qinspect:0.3
     build: .
     command: ["qinspect", "dashboard", "--db", "/data/qinspect.db", "--port", "8501"]
     ports: ["8501:8501"]
     volumes: ["qinspect-data:/data"]
+    environment:
+      QINSPECT_TZ: Asia/Seoul
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     depends_on: [api]
   mqtt:
     image: eclipse-mosquitto:2

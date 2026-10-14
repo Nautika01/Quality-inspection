@@ -21,15 +21,19 @@ import numpy as np
 from scipy import ndimage as ndi
 from scipy.spatial import cKDTree
 
-from .vision import measure_geometry
+from .vision import VisionError, measure_geometry, to_gray8
 
 PATCH = 8
 STRIDE = 4
 
 
-def _part_frame(img: np.ndarray, size: int = 192) -> tuple[np.ndarray, np.ndarray]:
-    """Crop the part to a canonical frame (centred, fixed scale) and return (image, face mask)."""
-    g = measure_geometry(img)
+def _part_frame(img: np.ndarray, size: int = 192, has_pocket: bool = True) -> tuple[np.ndarray, np.ndarray]:
+    """Crop the part to a canonical frame (centred, fixed scale) and return (image, face mask).
+
+    Raises VisionError when the part cannot be located (callers decide how to report it).
+    """
+    img = to_gray8(img)
+    g = measure_geometry(img, require_pocket=has_pocket)
     o, p = g.outer, g.pocket
     scale = (size / 2 - 4) / o.r
     yy, xx = np.mgrid[0:size, 0:size].astype(float)
@@ -37,14 +41,16 @@ def _part_frame(img: np.ndarray, size: int = 192) -> tuple[np.ndarray, np.ndarra
     sy = (yy - size / 2) / scale + o.cy
     canon = ndi.map_coordinates(img.astype(float), [sy, sx], order=1, mode="nearest")
     r = np.hypot(xx - size / 2, yy - size / 2)
-    rp = np.hypot(xx - size / 2 - (p.cx - o.cx) * scale, yy - size / 2 - (p.cy - o.cy) * scale)
-    face = (r < o.r * scale - 4) & (rp > p.r * scale + 4)
+    face = r < o.r * scale - 4
+    if p is not None:
+        rp = np.hypot(xx - size / 2 - (p.cx - o.cx) * scale, yy - size / 2 - (p.cy - o.cy) * scale)
+        face &= rp > p.r * scale + 4
     return canon, face
 
 
-def patch_features(img: np.ndarray, size: int = 192) -> tuple[np.ndarray, np.ndarray, tuple[int, int]]:
+def patch_features(img: np.ndarray, size: int = 192, has_pocket: bool = True) -> tuple[np.ndarray, np.ndarray, tuple[int, int]]:
     """Return (features [N, D], valid-patch mask [N], grid shape) for one image."""
-    canon, face = _part_frame(img, size)
+    canon, face = _part_frame(img, size, has_pocket)
     # remove slow illumination so features describe texture, not lighting
     flat = canon - ndi.gaussian_filter(canon, 8)
     gx = ndi.sobel(flat, axis=1)
@@ -98,20 +104,27 @@ class AnomalyModel:
     train_scores: np.ndarray
     k: int = 1
     size: int = 192
+    has_pocket: bool = True
 
     def __post_init__(self):
+        if self.k < 1 or self.k > len(self.bank):
+            raise ValueError(f"k must be in 1..{len(self.bank)} (bank size)")
+        if not np.isfinite(self.threshold):
+            raise ValueError("threshold must be finite")
         self._tree = cKDTree(self.bank)
 
     def score_map(self, img: np.ndarray) -> tuple[float, np.ndarray]:
-        F, valid, grid = patch_features(img, self.size)
+        """Image score and patch-level anomaly map. Raises VisionError if the part is not found."""
+        F, valid, grid = patch_features(img, self.size, self.has_pocket)
         Z = (F - self.mu) / self.sd
+        if valid.sum() < 3:
+            raise VisionError("degenerate_geometry", "fewer than 3 face patches")
         d, _ = self._tree.query(Z[valid], k=self.k)
         d = d if self.k == 1 else d.mean(1)
         amap = np.zeros(len(F))
         amap[valid] = d
         amap = amap.reshape(grid)
-        score = float(np.sort(d)[-3:].mean()) if len(d) >= 3 else float(d.max() if len(d) else 0.0)
-        return score, amap
+        return float(np.sort(d)[-3:].mean()), amap
 
     def score(self, img: np.ndarray) -> float:
         return self.score_map(img)[0]
@@ -121,31 +134,72 @@ class AnomalyModel:
         return s > self.threshold, s
 
     def save(self, path: str | Path, meta: dict | None = None) -> str:
-        np.savez_compressed(path, bank=self.bank, mu=self.mu, sd=self.sd, threshold=self.threshold,
-                            train_scores=self.train_scores, k=self.k, size=self.size,
-                            meta=json.dumps(meta or {}))
+        """Write the model; returns its content hash. The path always gets a .npz suffix."""
+        path = Path(path)
+        if path.suffix != ".npz":
+            path = path.with_suffix(path.suffix + ".npz")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("wb") as fh:
+            np.savez_compressed(fh, bank=self.bank.astype(np.float32), mu=self.mu.astype(np.float64),
+                                sd=self.sd.astype(np.float64), threshold=float(self.threshold),
+                                train_scores=self.train_scores.astype(np.float64), k=int(self.k),
+                                size=int(self.size), has_pocket=bool(self.has_pocket),
+                                meta=json.dumps(meta or {}))
         return model_hash(path)
 
     @classmethod
     def load(cls, path: str | Path) -> "AnomalyModel":
         z = np.load(path, allow_pickle=False)
-        return cls(z["bank"], z["mu"], z["sd"], float(z["threshold"]), z["train_scores"], int(z["k"]), int(z["size"]))
+        has_pocket = bool(z["has_pocket"]) if "has_pocket" in z.files else True
+        return cls(z["bank"], z["mu"], z["sd"], float(z["threshold"]), z["train_scores"], int(z["k"]),
+                   int(z["size"]), has_pocket)
 
 
 def model_hash(path: str | Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:16]
 
 
+MIN_TRAIN_IMAGES = 4
+RECOMMENDED_TRAIN_IMAGES = 10
+
+
 def train(good_images: list[np.ndarray], *, coreset: int = 4000, k: int = 1, seed: int = 0,
-          threshold_sigma: float = 5.0) -> AnomalyModel:
-    """Fit the memory bank on good images; threshold = robust median + `threshold_sigma` * MAD-sigma
-    of 2-fold held-out scores on the training set (so it reflects unseen good parts)."""
-    if len(good_images) < 4:
-        raise ValueError("need at least 4 good images")
+          threshold_sigma: float = 5.0, has_pocket: bool = True, names: list[str] | None = None) -> AnomalyModel:
+    """Fit the memory bank on good images.
+
+    Threshold = median + `threshold_sigma` * spread of 2-fold held-out scores on the training
+    set (so it reflects unseen good parts). The spread is floored at 10 % of the median so
+    near-duplicate training sets cannot collapse the threshold; exact duplicate images are
+    dropped with a warning. Raises ValueError naming the image if one cannot be segmented.
+    """
+    import warnings
+
+    names = names or [f"image[{i}]" for i in range(len(good_images))]
+    # drop exact duplicates (same bytes) - they would make held-out scores meaningless
+    uniq, seen = [], set()
+    for im, nm in zip(good_images, names):
+        h = hashlib.sha256(np.ascontiguousarray(im).tobytes()).hexdigest()
+        if h in seen:
+            warnings.warn(f"train: dropping duplicate image {nm}", stacklevel=2)
+            continue
+        seen.add(h)
+        uniq.append((im, nm))
+    if len(uniq) < MIN_TRAIN_IMAGES:
+        raise ValueError(f"need at least {MIN_TRAIN_IMAGES} distinct good images, got {len(uniq)}")
+    if len(uniq) < RECOMMENDED_TRAIN_IMAGES:
+        warnings.warn(f"train: only {len(uniq)} images; threshold estimate is rough (recommend >= {RECOMMENDED_TRAIN_IMAGES})",
+                      stacklevel=2)
+    if k < 1:
+        raise ValueError("k must be >= 1")
     rng = np.random.default_rng(seed)
     per_image = []
-    for im in good_images:
-        F, valid, _ = patch_features(im)
+    for im, nm in uniq:
+        try:
+            F, valid, _ = patch_features(im, has_pocket=has_pocket)
+        except VisionError as exc:
+            raise ValueError(f"cannot use {nm} for training: {exc}") from exc
+        if valid.sum() < 3:
+            raise ValueError(f"cannot use {nm} for training: too few face patches")
         per_image.append(F[valid].astype(np.float32))
     allF = np.concatenate(per_image)
     mu, sd = allF.mean(0), allF.std(0) + 1e-6
@@ -155,18 +209,20 @@ def train(good_images: list[np.ndarray], *, coreset: int = 4000, k: int = 1, see
     folds = np.arange(len(Z)) % 2
     for f in (0, 1):
         bank_f = np.concatenate([z for z, g in zip(Z, folds) if g != f])
+        kk = min(k, len(bank_f))
         tree = cKDTree(bank_f[_greedy_coreset(bank_f, coreset, rng)])
         for i in np.nonzero(folds == f)[0]:
-            d, _ = tree.query(Z[i], k=k)
-            d = d if k == 1 else d.mean(1)
+            d, _ = tree.query(Z[i], k=kk)
+            d = d if kk == 1 else d.mean(1)
             scores[i] = float(np.sort(d)[-3:].mean())
-    med = np.median(scores)
-    mad_sigma = 1.4826 * np.median(np.abs(scores - med)) + 1e-9
-    thr = float(med + threshold_sigma * mad_sigma)
+    med = float(np.median(scores))
+    spread = max(1.4826 * float(np.median(np.abs(scores - med))), float(scores.std()), 0.1 * med, 1e-6)
+    thr = float(med + threshold_sigma * spread)
 
     allZ = np.concatenate(Z)
     bank = allZ[_greedy_coreset(allZ, coreset, rng)]
-    return AnomalyModel(bank=bank, mu=mu, sd=sd, threshold=thr, train_scores=scores, k=k)
+    return AnomalyModel(bank=bank, mu=mu, sd=sd, threshold=thr, train_scores=scores, k=min(k, len(bank)),
+                        has_pocket=has_pocket)
 
 
 def auroc(scores_neg: np.ndarray, scores_pos: np.ndarray) -> float:
