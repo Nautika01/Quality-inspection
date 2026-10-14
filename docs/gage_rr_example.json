@@ -1,0 +1,34 @@
+{
+  "od_mm": {
+    "characteristic": "outer diameter",
+    "n_parts": 6,
+    "n_operators": 3,
+    "n_trials": 2,
+    "repeatability": 0.002825107105709062,
+    "reproducibility": 0.0005269709789895444,
+    "grr": 0.0028738351677549344,
+    "part_variation": 0.06435061302602649,
+    "total_variation": 0.06441475238947081,
+    "pct_grr_tv": 4.461454963575533,
+    "pct_grr_tol": 8.621505503264833,
+    "ndc": 31,
+    "tolerance": 0.1999999999999993,
+    "verdict": "acceptable"
+  },
+  "pocket_mm": {
+    "characteristic": "pocket diameter",
+    "n_parts": 6,
+    "n_operators": 3,
+    "n_trials": 2,
+    "repeatability": 0.004488503833871381,
+    "reproducibility": 0.0022288574551903593,
+    "grr": 0.005011434148248955,
+    "part_variation": 0.06271819180535512,
+    "total_variation": 0.0629180900501243,
+    "pct_grr_tv": 7.965013153222783,
+    "pct_grr_tol": 18.792878055933564,
+    "ndc": 17,
+    "tolerance": 0.16000000000000014,
+    "verdict": "marginal"
+  }
+}

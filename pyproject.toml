@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qinspect"
-version = "0.1.0"
-description = "Smart-factory quality inspection MVP for precision defense parts (synthetic data, vision, SPC)"
+version = "0.2.0"
+description = "Smart-factory quality inspection for precision defense parts: vision, anomaly detection, SPC, MSA, traceability"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -17,7 +17,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+server = ["fastapi>=0.110", "uvicorn>=0.27", "python-multipart>=0.0.9", "streamlit>=1.30", "paho-mqtt>=2.0"]
+dev = ["pytest>=7", "httpx>=0.25", "qinspect[server]"]
 
 [project.scripts]
 qinspect = "qinspect.cli:main"

@@ -9,3 +9,5 @@ dist/
 # generated data / run outputs
 data/
 runs/
+*.db
+*.npz

@@ -18,7 +18,9 @@ from .spec import PartSpec
 BACKGROUND_LEVEL = 30.0
 RING_LEVEL = 180.0
 POCKET_LEVEL = 60.0
-DEFECT_TYPES = ("scratch", "dent")
+DEFECT_TYPES = ("scratch", "dent", "pit")
+# which detector class each synthetic defect maps to (pit is a small dent)
+DETECTED_KIND = {"scratch": "scratch", "dent": "dent", "pit": "dent"}
 
 
 @dataclass
@@ -28,10 +30,17 @@ class PartTruth:
     pocket_mm: float
     concentricity_mm: float
     defects: list[str] = field(default_factory=list)
+    defect_len_mm: float = 0.0
+
+    def expected_grade(self, spec: PartSpec) -> str:
+        if not self.defects:
+            return ""
+        return spec.grading.grade(DETECTED_KIND[self.defects[0]], self.defect_len_mm)
 
     def expected_verdict(self, spec: PartSpec) -> str:
+        grade = self.expected_grade(spec)
         ok = (
-            not self.defects
+            grade not in spec.grading.reject_grades
             and spec.outer_diameter.ok(self.od_mm)
             and spec.pocket_diameter.ok(self.pocket_mm)
             and self.concentricity_mm <= spec.max_concentricity_mm
@@ -60,17 +69,17 @@ def _scratch_map(rng, xx, yy, cx, cy, r_lo, r_hi):
     d = np.hypot(xx - (ax + t * vx), yy - (ay + t * vy))
     width = rng.uniform(0.9, 1.4)
     depth = rng.uniform(28, 42)
-    return depth * np.exp(-((d / width) ** 2))
+    return depth * np.exp(-((d / width) ** 2)), 2 * half
 
 
-def _dent_map(rng, xx, yy, cx, cy, r_lo, r_hi):
-    """Round dark pit (gaussian) inside the annulus."""
-    sigma = rng.uniform(2.0, 3.0)
+def _dent_map(rng, xx, yy, cx, cy, r_lo, r_hi, sigma_range=(2.2, 3.0)):
+    """Round dark pit (gaussian) inside the annulus. Visible length ~ 4 sigma."""
+    sigma = rng.uniform(*sigma_range)
     rho = rng.uniform(r_lo + 3 * sigma, r_hi - 3 * sigma)
     phi = rng.uniform(0, 2 * np.pi)
     x0, y0 = cx + rho * np.cos(phi), cy + rho * np.sin(phi)
     depth = rng.uniform(28, 45)
-    return depth * np.exp(-((xx - x0) ** 2 + (yy - y0) ** 2) / (2 * sigma**2))
+    return depth * np.exp(-((xx - x0) ** 2 + (yy - y0) ** 2) / (2 * sigma**2)), 4 * sigma
 
 
 def render_part(
@@ -82,8 +91,12 @@ def render_part(
     pocket_offset_mm: tuple[float, float] = (0.0, 0.0),
     defects: tuple[str, ...] = (),
     noise_sigma: float = 3.0,
+    return_defect_len: bool = False,
 ) -> np.ndarray:
-    """Render one top-view grayscale image (uint8) of the part."""
+    """Render one top-view grayscale image (uint8) of the part.
+
+    With `return_defect_len=True` also returns the longest injected defect in mm.
+    """
     size = spec.image_size
     ppm = spec.px_per_mm
     yy, xx = np.mgrid[0:size, 0:size].astype(float)
@@ -103,13 +116,18 @@ def render_part(
     # metal face: radial shading + concentric machining marks
     ring = RING_LEVEL + 10 * (r / r_out) + 4 * np.sin(2 * np.pi * r / 6.0 + rng.uniform(0, 2 * np.pi))
     r_lo, r_hi = r_in + 6 + np.hypot(px - cx, py - cy), r_out - 6
+    defect_len_px = 0.0
     for kind in defects:
         if kind == "scratch":
-            ring = ring - _scratch_map(rng, xx, yy, cx, cy, r_lo, r_hi)
+            m, ln = _scratch_map(rng, xx, yy, cx, cy, r_lo, r_hi)
         elif kind == "dent":
-            ring = ring - _dent_map(rng, xx, yy, cx, cy, r_lo, r_hi)
+            m, ln = _dent_map(rng, xx, yy, cx, cy, r_lo, r_hi)
+        elif kind == "pit":
+            m, ln = _dent_map(rng, xx, yy, cx, cy, r_lo, r_hi, sigma_range=(0.8, 1.1))
         else:
             raise ValueError(f"unknown defect type: {kind}")
+        ring = ring - m
+        defect_len_px = max(defect_len_px, ln)
 
     img = BACKGROUND_LEVEL * (1 - a_out) + a_out * (ring * (1 - a_in) + POCKET_LEVEL * a_in)
 
@@ -117,7 +135,10 @@ def render_part(
     gx, gy = rng.uniform(-10, 10, size=2)
     img = img + gx * (xx - cx) / size + gy * (yy - cy) / size
     img = img + rng.normal(0, noise_sigma, size=img.shape)
-    return np.clip(np.round(img), 0, 255).astype(np.uint8)
+    out = np.clip(np.round(img), 0, 255).astype(np.uint8)
+    if return_defect_len:
+        return out, defect_len_px / ppm
+    return out
 
 
 def generate_lot(
@@ -169,12 +190,13 @@ def generate_lot(
         if rng.random() < defect_rate:
             defects = (str(rng.choice(DEFECT_TYPES)),)
 
-        img = render_part(
-            spec, rng, od_mm=od_mm, pocket_mm=pocket_mm, pocket_offset_mm=tuple(offset), defects=defects
+        img, dlen = render_part(
+            spec, rng, od_mm=od_mm, pocket_mm=pocket_mm, pocket_offset_mm=tuple(offset), defects=defects,
+            return_defect_len=True,
         )
         Image.fromarray(img).save(img_dir / f"{serial}.png")
 
-        truth = PartTruth(serial, od_mm, pocket_mm, float(np.hypot(*offset)), list(defects))
+        truth = PartTruth(serial, od_mm, pocket_mm, float(np.hypot(*offset)), list(defects), dlen)
         rows.append(
             {
                 "serial": serial,
@@ -184,6 +206,8 @@ def generate_lot(
                 "pocket_mm": round(truth.pocket_mm, 5),
                 "concentricity_mm": round(truth.concentricity_mm, 5),
                 "defect_type": defects[0] if defects else "none",
+                "defect_len_mm": round(dlen, 3),
+                "expected_grade": truth.expected_grade(spec),
                 "expected_verdict": truth.expected_verdict(spec),
             }
         )

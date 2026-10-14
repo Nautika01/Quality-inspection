@@ -30,7 +30,7 @@ def test_good_part_passes_with_accurate_dimensions(seed):
 def test_surface_defect_detected_and_classified(kind, seed):
     res = inspect_array(_render(100 + seed, defects=(kind,)), "S", SPEC)
     assert res.verdict == "NG"
-    assert {d.kind for d in res.defects} == {kind}
+    assert {g.defect.kind for g in res.defects} == {kind}
 
 
 def test_out_of_tolerance_dimensions_flagged():

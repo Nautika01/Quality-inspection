@@ -1,0 +1,19 @@
+services:
+  api:
+    build: .
+    ports: ["8000:8000"]
+    volumes: ["qinspect-data:/data"]
+    environment:
+      QINSPECT_DB: /data/qinspect.db
+  dashboard:
+    build: .
+    command: ["qinspect", "dashboard", "--db", "/data/qinspect.db", "--port", "8501"]
+    ports: ["8501:8501"]
+    volumes: ["qinspect-data:/data"]
+    depends_on: [api]
+  mqtt:
+    image: eclipse-mosquitto:2
+    ports: ["1883:1883"]
+    command: ["mosquitto", "-c", "/mosquitto-no-auth.conf"]
+volumes:
+  qinspect-data:

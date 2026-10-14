@@ -13,9 +13,11 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from PIL import Image, ImageDraw  # noqa: E402
 
-from .inspector import InspectionResult, inspect_file  # noqa: E402
+from .anomaly import AnomalyModel, model_hash  # noqa: E402
+from .inspector import InspectionResult, inspect_array  # noqa: E402
 from .spc import XbarRChart, capability, xbar_r  # noqa: E402
 from .spec import PartSpec  # noqa: E402
+from .synth import DETECTED_KIND  # noqa: E402
 
 _COLORS = {"scratch": (255, 40, 40), "dent": (255, 170, 0)}
 
@@ -27,10 +29,12 @@ def save_overlay(img_path: Path, result: InspectionResult, out_path: Path) -> No
     if g is not None:
         for c in (g.outer, g.pocket):
             draw.ellipse([c.cx - c.r, c.cy - c.r, c.cx + c.r, c.cy + c.r], outline=(0, 200, 255))
-    for d in result.defects:
+    for gd in result.defects:
+        d = gd.defect
         x0, y0, x1, y1 = d.bbox
-        draw.rectangle([x0 - 2, y0 - 2, x1 + 2, y1 + 2], outline=_COLORS.get(d.kind, (255, 0, 255)), width=2)
-        draw.text((x0, max(0, y0 - 12)), d.kind, fill=_COLORS.get(d.kind, (255, 0, 255)))
+        col = _COLORS.get(d.kind, (255, 0, 255))
+        draw.rectangle([x0 - 2, y0 - 2, x1 + 2, y1 + 2], outline=col, width=2)
+        draw.text((x0, max(0, y0 - 12)), f"{d.kind}/{gd.grade}", fill=col)
     draw.text((4, 4), f"{result.serial} {result.verdict}", fill=(255, 255, 255))
     img.save(out_path)
 
@@ -81,17 +85,29 @@ def _metrics(df: pd.DataFrame, truth: pd.DataFrame) -> dict:
     fp = int(((m.verdict == "NG") & (m.expected_verdict == "PASS")).sum())
     fn = int(((m.verdict == "PASS") & (m.expected_verdict == "NG")).sum())
     defect_rows = m[m.defect_type != "none"]
-    type_ok = (defect_rows.defect_types == defect_rows.defect_type).mean() if len(defect_rows) else float("nan")
+    expected_kind = defect_rows.defect_type.map(DETECTED_KIND)
+    type_ok = (defect_rows.defect_types.fillna("") == expected_kind).mean() if len(defect_rows) else float("nan")
+    grade_ok = (defect_rows.worst_grade.fillna("") == defect_rows.expected_grade.fillna("")).mean() if len(defect_rows) else float("nan")
     od_err = (m.od_mm - m.od_mm_true).dropna()
-    return {
+    out = {
         "n": len(m),
         "confusion": {"tp_ng": tp, "tn_pass": tn, "fp_overkill": fp, "fn_escape": fn},
         "accuracy": (tp + tn) / max(len(m), 1),
         "escape_rate": fn / max(tp + fn, 1),
         "overkill_rate": fp / max(tn + fp, 1),
         "defect_type_accuracy": float(type_ok),
+        "defect_grade_accuracy": float(grade_ok),
         "od_measurement_error_mm": {"bias": float(od_err.mean()), "std": float(od_err.std()), "max_abs": float(od_err.abs().max())},
+        "escaped_serials": m[(m.verdict == "PASS") & (m.expected_verdict == "NG")].serial.tolist(),
+        "overkill_serials": m[(m.verdict == "NG") & (m.expected_verdict == "PASS")].serial.tolist(),
     }
+    if "anomaly_score" in m and m.anomaly_score.notna().any():
+        from .anomaly import auroc
+
+        good = m[m.defect_type == "none"].anomaly_score.dropna()
+        bad = m[m.defect_type != "none"].anomaly_score.dropna()
+        out["anomaly_auroc_surface_defects"] = auroc(good.to_numpy(), bad.to_numpy())
+    return out
 
 
 def run_batch(
@@ -102,6 +118,9 @@ def run_batch(
     subgroup: int = 5,
     baseline: int | None = 10,
     truth_csv: str | Path | None = None,
+    model_path: str | Path | None = None,
+    db_path: str | Path | None = None,
+    lot_id: str | None = None,
 ) -> dict:
     image_dir, out = Path(image_dir), Path(out_dir)
     (out / "overlays").mkdir(parents=True, exist_ok=True)
@@ -110,10 +129,22 @@ def run_batch(
     if not paths:
         raise FileNotFoundError(f"no .png images in {image_dir}")
 
+    model = AnomalyModel.load(model_path) if model_path else None
+    mh = model_hash(model_path) if model_path else None
+    db = None
+    if db_path:
+        from .db import InspectionDB
+
+        db = InspectionDB(db_path)
+    lot_id = lot_id or paths[0].stem.rsplit("-", 1)[0]
+
     results = []
     for p in paths:
-        r = inspect_file(p, spec)
+        img = np.asarray(Image.open(p).convert("L"))
+        r = inspect_array(img, p.stem, spec, model)
         results.append(r)
+        if db is not None:
+            db.add_inspection(r, lot_id, spec, mh, "batch")
         if r.verdict == "NG":
             save_overlay(p, r, out / "overlays" / f"{r.serial}.png")
 
@@ -122,11 +153,14 @@ def run_batch(
 
     summary: dict = {
         "part": spec.name,
+        "lot_id": lot_id,
         "n_inspected": len(df),
         "n_pass": int((df.verdict == "PASS").sum()),
         "n_ng": int((df.verdict == "NG").sum()),
         "first_pass_yield": float((df.verdict == "PASS").mean()),
         "ng_reasons": df.reasons[df.reasons != ""].str.split(";").explode().value_counts().to_dict(),
+        "minor_defects_recorded": int((df.worst_grade == "minor").sum()),
+        "anomaly_model": mh,
     }
 
     od = df.od_mm.dropna().to_numpy()
@@ -147,6 +181,9 @@ def run_batch(
 
     if truth_csv is not None and Path(truth_csv).exists():
         summary["vs_ground_truth"] = _metrics(df, pd.read_csv(truth_csv))
+    if db is not None:
+        summary["audit"] = db.verify_chain()
+        db.close()
 
     (out / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     return summary
