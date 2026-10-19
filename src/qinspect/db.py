@@ -25,8 +25,11 @@ import sqlite3
 import threading
 from pathlib import Path
 
-from .inspector import VERDICT_ERROR, VERDICT_NG, VERDICT_PASS, InspectionResult, utc_now
+from .inspector import VERDICT_ERROR, VERDICT_NG, VERDICT_PASS, InspectionResult
 from .spec import PartSpec
+from .util import utc_now, utc_param
+
+SCHEMA_VERSION = 2  # PRAGMA user_version; 0/absent = v0.2 layout, migrated on open
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS lots (
@@ -56,6 +59,7 @@ CREATE TABLE IF NOT EXISTS inspections (
     image_sha256 TEXT,
     image_path TEXT,
     reinspection_of INTEGER REFERENCES inspections(id),
+    canon_version INTEGER NOT NULL DEFAULT 2,
     prev_hash TEXT NOT NULL UNIQUE,
     record_hash TEXT NOT NULL UNIQUE
 );
@@ -190,8 +194,33 @@ def canonical_record(rec: dict) -> str:
     return json.dumps(clean, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
+def canonical_record_v1(rec: dict) -> str:
+    """v0.2 canonical form (kept so legacy rows stay verifiable after migration)."""
+    keys = ("serial", "lot_id", "inspected_at", "verdict", "reasons", "od_mm", "pocket_mm", "concentricity_mm",
+            "worst_grade", "anomaly_score", "program_version", "spec_hash", "model_hash", "station")
+    legacy = {k: rec.get(k) for k in keys}
+    legacy["defects"] = [
+        {"kind": d["kind"], "grade": d["grade"], "length_mm": d["length_mm"], "area_px": d["area_px"],
+         "bbox": [int(x) for x in d["bbox"]]} for d in rec.get("defects", [])
+    ]
+    return json.dumps(legacy, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+_CANONICAL = {1: canonical_record_v1, 2: canonical_record}
+
+
 def _hash(prev: str, canonical: str) -> str:
     return hashlib.sha256((prev + canonical).encode()).hexdigest()
+
+
+# columns added after v0.2, applied with ALTER TABLE on legacy files (all nullable / defaulted)
+_MIGRATION_COLUMNS = {
+    "lots": [("spec_json", "TEXT"), ("status", "TEXT NOT NULL DEFAULT 'open'"), ("closed_at", "TEXT")],
+    "inspections": [("operator", "TEXT"), ("image_sha256", "TEXT"), ("image_path", "TEXT"),
+                    ("reinspection_of", "INTEGER REFERENCES inspections(id)"),
+                    ("canon_version", "INTEGER NOT NULL DEFAULT 2")],
+    "events": [("acked_by", "TEXT"), ("acked_at", "TEXT"), ("ack_note", "TEXT")],
+}
 
 
 class InspectionDB:
@@ -202,12 +231,54 @@ class InspectionDB:
         self._lock = threading.RLock()
         self.conn = sqlite3.connect(self.path, check_same_thread=False, timeout=timeout, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
+        self.migrated_from: int | None = None
         with self._lock:
             if self.path != ":memory:":
                 self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.execute("PRAGMA busy_timeout=%d" % int(timeout * 1000))
             self.conn.execute("PRAGMA foreign_keys=ON")
-            self.conn.executescript(SCHEMA)
+            self._open_schema()
+
+    def _open_schema(self) -> None:
+        """Create a fresh schema or migrate a v0.2 file in place (idempotent, one transaction)."""
+        version = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
+        if version > SCHEMA_VERSION:
+            raise RuntimeError(f"{self.path} was written by a newer qinspect (schema {version} > {SCHEMA_VERSION})")
+        has_inspections = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='inspections'").fetchone() is not None
+        legacy = version == 0 and has_inspections
+        if legacy:  # column additions in one transaction; executescript() would auto-commit, so keep it outside
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._migrate_from_v02()
+                self.conn.execute("COMMIT")
+            except BaseException:
+                self.conn.execute("ROLLBACK")
+                raise
+        self.conn.executescript(SCHEMA)  # new tables / indexes; no-op for existing ones (each statement idempotent)
+        if version != SCHEMA_VERSION:
+            self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+    def _migrate_from_v02(self) -> None:
+        for table, cols in _MIGRATION_COLUMNS.items():
+            if self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is None:
+                continue
+            present = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            for name, decl in cols:
+                if name not in present:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        # rows written by v0.2 were hashed with the old canonical form
+        self.conn.execute("UPDATE inspections SET canon_version=1 WHERE canon_version IS NULL OR canon_version=2")
+        self.conn.execute("UPDATE lots SET status='open' WHERE status IS NULL")
+        if self.conn.execute("SELECT 1 FROM lots WHERE created_at IS NULL LIMIT 1").fetchone():
+            self.conn.execute("UPDATE lots SET created_at=? WHERE created_at IS NULL", (utc_now(),))
+        dup = self.conn.execute(
+            "SELECT prev_hash, COUNT(*) c FROM inspections GROUP BY prev_hash HAVING c > 1 LIMIT 1").fetchone()
+        if dup:
+            raise RuntimeError("legacy database has a forked hash chain (duplicate prev_hash "
+                               f"{dup['prev_hash'][:12]}...); export it and start a new database")
+        self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_insp_prev ON inspections(prev_hash)")
+        self.migrated_from = 0
 
     def close(self) -> None:
         with self._lock:
@@ -302,12 +373,12 @@ class InspectionDB:
                 cur = self.conn.execute(
                     """INSERT INTO inspections(serial, lot_id, inspected_at, verdict, reasons, od_mm, pocket_mm,
                        concentricity_mm, worst_grade, anomaly_score, program_version, spec_hash, model_hash, station,
-                       operator, image_sha256, image_path, reinspection_of, prev_hash, record_hash)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       operator, image_sha256, image_path, reinspection_of, canon_version, prev_hash, record_hash)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (rec["serial"], lot_id, rec["inspected_at"], rec["verdict"], rec["reasons"], _num(rec["od_mm"]),
                      _num(rec["pocket_mm"]), _num(rec["concentricity_mm"]), rec["worst_grade"], _num(rec["anomaly_score"]),
                      rec["program_version"], rec["spec_hash"], model_hash, station, operator, image_hash, image_path,
-                     reinspection_of, prev, rh),
+                     reinspection_of, SCHEMA_VERSION, prev, rh),
                 )
                 iid = cur.lastrowid
                 for d in rec["defects"]:
@@ -323,7 +394,13 @@ class InspectionDB:
 
     def inspections(self, lot_id: str | None = None, limit: int | None = None, *, station: str | None = None,
                     since: str | None = None, until: str | None = None, serial: str | None = None) -> list[dict]:
-        """Rows in chronological order; `limit` keeps the newest N (None or <= 0 = all)."""
+        """Rows in chronological order; `limit` keeps the newest N (None or <= 0 = all).
+
+        `since`/`until` are ISO-8601 (normalised to UTC); a malformed value raises ValueError.
+        """
+        since, until = utc_param(since, "since"), utc_param(until, "until")
+        if since and until and since >= until:
+            raise ValueError("since must be earlier than until")
         where, args = [], []
         for col, val in (("lot_id", lot_id), ("station", station), ("serial", serial)):
             if val:
@@ -424,17 +501,31 @@ class InspectionDB:
         if decision not in ("ACCEPT", "REJECT", "HOLD"):
             raise ValueError("decision must be ACCEPT, REJECT or HOLD")
         with self._lock:
-            if self.conn.execute("SELECT 1 FROM lots WHERE lot_id=?", (lot_id,)).fetchone() is None:
+            row = self.conn.execute("SELECT status, closed_at FROM lots WHERE lot_id=?", (lot_id,)).fetchone()
+            if row is None:
                 raise ValueError(f"lot {lot_id} not found")
-            head = self.verify_chain()["head"]
+            if row["status"] == "closed":
+                raise ValueError(f"lot {lot_id} already closed at {row['closed_at']}")
+            chain = self.verify_chain()
+            if not chain["ok"]:
+                raise ValueError("audit chain is not intact; refusing to close the lot")
+            head = chain["head"]
             now = utc_now()
-            self.conn.execute(
-                """INSERT INTO lot_dispositions(lot_id, decision, plan_json, sample_json, n_defective, n_critical,
-                   decided_by, decided_at, note, chain_head) VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (lot_id, decision, json.dumps(plan), json.dumps(sample), n_defective, n_critical, decided_by, now, note, head))
-            if decision != "HOLD":
-                self.conn.execute("UPDATE lots SET status='closed', closed_at=? WHERE lot_id=?", (now, lot_id))
-            self.anchor_head(f"lot {lot_id} {decision}")
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                self.conn.execute(
+                    """INSERT INTO lot_dispositions(lot_id, decision, plan_json, sample_json, n_defective, n_critical,
+                       decided_by, decided_at, note, chain_head) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (lot_id, decision, json.dumps(plan), json.dumps(sample), n_defective, n_critical, decided_by, now, note, head))
+                if decision != "HOLD":
+                    self.conn.execute("UPDATE lots SET status='closed', closed_at=? WHERE lot_id=?", (now, lot_id))
+                n = int(self.conn.execute("SELECT COUNT(*) FROM inspections").fetchone()[0])
+                self.conn.execute("INSERT INTO anchors(ts, n_records, head, note) VALUES (?,?,?,?)",
+                                  (now, n, head, f"lot {lot_id} {decision}"))
+                self.conn.execute("COMMIT")
+            except BaseException:
+                self.conn.execute("ROLLBACK")
+                raise
         return {"lot_id": lot_id, "decision": decision, "decided_at": now, "chain_head": head}
 
     def lot_dispositions(self, lot_id: str) -> list[dict]:
@@ -514,12 +605,16 @@ class InspectionDB:
             return cur.rowcount == 1
 
     def anchor_head(self, note: str | None = None) -> dict:
-        """Record the current chain head; export it somewhere outside this database too."""
+        """Record the current chain head; export it somewhere outside this database too.
+
+        Refuses when the chain does not verify against the existing anchors, so a tail
+        deletion can never be laundered by the next routine anchor.
+        """
         with self._lock:
-            row = self.conn.execute("SELECT COUNT(*), MAX(record_hash) FROM inspections").fetchone()
-            n = int(row[0])
-            head = self.conn.execute("SELECT record_hash FROM inspections ORDER BY id DESC LIMIT 1").fetchone()
-            head = head[0] if head else GENESIS
+            chain = self.verify_chain()
+            if not chain["ok"]:
+                raise ValueError(f"audit chain is not intact ({chain.get('note') or 'broken at id ' + str(chain.get('broken_at_id'))}); refusing to anchor")
+            n, head = chain["checked"], chain["head"]
             self.conn.execute("INSERT INTO anchors(ts, n_records, head, note) VALUES (?,?,?,?)", (utc_now(), n, head, note))
         return {"n_records": n, "head": head}
 
@@ -528,11 +623,12 @@ class InspectionDB:
         return dict(row) if row else None
 
     def verify_chain(self) -> dict:
-        """Recompute every hash in one read; report the first broken link, and check the last anchor."""
+        """Recompute every hash in one read; report the first broken link, and check every anchor."""
         with self._lock:
             rows = self.conn.execute("SELECT * FROM inspections ORDER BY id").fetchall()
             drows = self.conn.execute("SELECT * FROM defects ORDER BY inspection_id, id").fetchall()
-            anchor = self.last_anchor()
+            anchors = [dict(r) for r in self.conn.execute("SELECT * FROM anchors ORDER BY id")]
+            anchor = anchors[-1] if anchors else None
         by_insp: dict[int, list[dict]] = {}
         for d in drows:
             by_insp.setdefault(d["inspection_id"], []).append(
@@ -540,21 +636,24 @@ class InspectionDB:
                  "bbox": [d["x0"], d["y0"], d["x1"], d["y1"]]})
         prev, n = GENESIS, 0
         heads: dict[int, str] = {}
+        keys = rows[0].keys() if rows else []
         for r in rows:
-            rec = {k: r[k] for k in _RECORD_FIELDS}
+            rec = {k: (r[k] if k in keys else None) for k in _RECORD_FIELDS}
             rec["defects"] = by_insp.get(r["id"], [])
-            expected = _hash(prev, canonical_record(rec))
+            canon = _CANONICAL.get(r["canon_version"] if "canon_version" in keys else SCHEMA_VERSION, canonical_record)
+            expected = _hash(prev, canon(rec))
             if r["prev_hash"] != prev or r["record_hash"] != expected:
                 return {"ok": False, "checked": n, "broken_at_id": r["id"], "serial": r["serial"], "head": prev}
             prev = r["record_hash"]
             n += 1
             heads[n] = prev
         out = {"ok": True, "checked": n, "head": prev}
-        if anchor:
-            an, ah = anchor["n_records"], anchor["head"]
+        for a in anchors:  # every anchor must still be a prefix of the chain
+            an, ah = a["n_records"], a["head"]
             if an > n or heads.get(an, GENESIS if an == 0 else None) != ah:
-                out.update(ok=False, anchor_mismatch={"anchored_n": an, "anchored_head": ah, "current_n": n},
-                           note="records after the last anchor were removed or the anchored prefix changed")
-            else:
-                out["anchor"] = {"n_records": an, "ts": anchor["ts"]}
+                out.update(ok=False, anchor_mismatch={"anchor_id": a["id"], "anchored_n": an, "anchored_head": ah, "current_n": n},
+                           note="records after an anchor were removed or the anchored prefix changed")
+                return out
+        if anchor:
+            out["anchor"] = {"n_records": anchor["n_records"], "ts": anchor["ts"]}
         return out

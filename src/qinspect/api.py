@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import io
 import os
-import re
 import secrets
 from pathlib import Path
 
@@ -29,15 +28,19 @@ from .inspector import VERDICT_PASS, inspect_array
 from .sampling import AQLS, INSPECTION_LEVELS, draw_sample, iso2859_single_normal, lot_disposition
 from .spc import SUBGROUP_SIZES, capability, xbar_r
 from .spec import PartSpec
+from .util import safe_name, utc_param
 from .vision import to_gray8
 
-_SERIAL_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
-
-def _safe_serial(s: str | None, fallback: str) -> str:
-    s = _SERIAL_RE.sub("_", Path(s or "").name.strip()) if s else ""
-    s = s.strip("._")[:64]
-    return s or fallback
+def _window(since: str | None, until: str | None) -> tuple[str | None, str | None]:
+    """Validate ISO-8601 query parameters (422 on a malformed value)."""
+    try:
+        s, u = utc_param(since, "since"), utc_param(until, "until")
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+    if s and u and s >= u:
+        raise HTTPException(422, "since must be earlier than until")
+    return s, u
 
 
 class DispositionIn(BaseModel):
@@ -118,7 +121,7 @@ def create_app(db_path: str | None = None, spec: PartSpec | None = None, model_p
             img = to_gray8(arr)
         except (UnidentifiedImageError, OSError, ValueError):
             raise HTTPException(400, "not a decodable image") from None
-        serial = _safe_serial(serial, _safe_serial(Path(file.filename or "").stem, "unknown"))
+        serial = safe_name(serial, safe_name(Path(file.filename or "").stem, "unknown"))
         res = inspect_array(img, serial, spec, model)
         img_hash = image_sha256(img)
         img_path = None
@@ -143,6 +146,7 @@ def create_app(db_path: str | None = None, spec: PartSpec | None = None, model_p
     def lot_summary(lot_id: str, subgroup: int = Query(5, ge=min(SUBGROUP_SIZES), le=max(SUBGROUP_SIZES)),
                     baseline: int = Query(25, ge=2), since: str | None = None, until: str | None = None,
                     station: str | None = None, db: InspectionDB = Depends(get_db)):
+        since, until = _window(since, until)
         s = db.lot_summary(lot_id, since=since, until=until, station=station)
         if s["n_inspections"] == 0:
             raise HTTPException(404, "lot not found or empty")
@@ -150,15 +154,18 @@ def create_app(db_path: str | None = None, spec: PartSpec | None = None, model_p
         rows = db.inspections(lot_id, since=since, until=until, station=station)
         s["spc"] = {}
         for ch, dim in (("od_mm", lot_spec.outer_diameter), ("pocket_mm", lot_spec.pocket_diameter)):
-            vals = np.array([r[ch] for r in rows if r[ch] is not None], dtype=float)
-            if dim is None or len(vals) < 2 * subgroup:
+            if dim is None:
                 continue
+            vals = np.array([r[ch] for r in rows if r[ch] is not None], dtype=float)
             frozen = db.active_limits(lot_spec.part_number, ch).get(ch)
+            need = frozen["n"] if frozen else 2 * subgroup  # frozen limits carry their own subgroup size
+            if len(vals) < need:
+                continue
             if frozen:
                 from .spc import ControlLimits, evaluate
 
                 ch_obj = evaluate(vals, ControlLimits.from_dict(frozen))
-                src = "frozen"
+                src = f"frozen:n={frozen['n']}"
             else:
                 ch_obj = xbar_r(vals, n=subgroup, baseline=baseline)
                 src = f"phase1:{baseline}"
@@ -172,6 +179,7 @@ def create_app(db_path: str | None = None, spec: PartSpec | None = None, model_p
     @app.get("/lots/{lot_id}/results")
     def lot_results(lot_id: str, limit: int | None = Query(None, ge=1, le=100000), since: str | None = None,
                     until: str | None = None, station: str | None = None, db: InspectionDB = Depends(get_db)):
+        since, until = _window(since, until)
         return db.inspections(lot_id, limit, since=since, until=until, station=station)
 
     @app.get("/lots/{lot_id}/open-ng")
@@ -239,20 +247,31 @@ def create_app(db_path: str | None = None, spec: PartSpec | None = None, model_p
         return {"id": event_id, "acked_by": body.by}
 
     @app.get("/spc/limits")
-    def spc_limits(db: InspectionDB = Depends(get_db)):
-        return db.active_limits(spec.part_number)
+    def spc_limits(lot_id: str | None = None, part_number: str | None = None, db: InspectionDB = Depends(get_db)):
+        """Active frozen limits for a part (default: the API's spec; or the part a lot is bound to)."""
+        if lot_id:
+            lot_spec = db.lot_spec(lot_id)
+            if lot_spec is None:
+                raise HTTPException(404, "lot not found")
+            part_number = lot_spec.part_number
+        return db.active_limits(part_number or spec.part_number)
 
     @app.post("/spc/limits/freeze", dependencies=[Depends(require_key)])
     def spc_freeze(body: FreezeIn, lot_id: str = Query(...), db: InspectionDB = Depends(get_db)):
-        """Freeze X-bar/R limits for a characteristic from a lot's Phase I data."""
+        """Freeze X-bar/R limits for a characteristic from a lot's Phase I data, filed under the lot's part."""
         if body.subgroup not in SUBGROUP_SIZES:
             raise HTTPException(422, f"subgroup must be one of {SUBGROUP_SIZES}")
+        lot_spec = db.lot_spec(lot_id)
+        if lot_spec is None:
+            raise HTTPException(404, "lot not found")
+        if body.characteristic != "od_mm" and not lot_spec.has_pocket:
+            raise HTTPException(422, f"{body.characteristic}: the lot's part has no pocket")
         vals = np.array([r[body.characteristic] for r in db.inspections(lot_id) if r[body.characteristic] is not None])
         if len(vals) < 2 * body.subgroup:
             raise HTTPException(422, "not enough data for two subgroups")
         ch = xbar_r(vals, n=body.subgroup, baseline=body.baseline)
-        lid = db.freeze_limits(spec.part_number, body.characteristic, ch.limits.to_dict(), body.frozen_by, lot_id)
-        return {"id": lid, "characteristic": body.characteristic, **ch.limits.to_dict()}
+        lid = db.freeze_limits(lot_spec.part_number, body.characteristic, ch.limits.to_dict(), body.frozen_by, lot_id)
+        return {"id": lid, "part_number": lot_spec.part_number, "characteristic": body.characteristic, **ch.limits.to_dict()}
 
     @app.get("/calibrations")
     def calibrations(db: InspectionDB = Depends(get_db)):
@@ -261,7 +280,10 @@ def create_app(db_path: str | None = None, spec: PartSpec | None = None, model_p
     @app.get("/reports/shift")
     def shift_report(lot_id: str, since: str, until: str, station: str | None = None,
                      db: InspectionDB = Depends(get_db)):
-        """Per-shift figures for a UTC time window [since, until) in ISO-8601 'Z' format."""
+        """Per-shift figures for a time window [since, until); ISO-8601, any offset (normalised to UTC)."""
+        since, until = _window(since, until)
+        if not since or not until:
+            raise HTTPException(422, "since and until are required")
         s = db.lot_summary(lot_id, since=since, until=until, station=station)
         alarms = db.events(prefix="alarm:", limit=None, lot_id=lot_id)
         s["alarms"] = [a for a in alarms if since <= a["ts"] < until]

@@ -58,7 +58,7 @@ def test_train_eval_and_specdoc(lot, tmp_path, capsys):
     assert main(["train-anomaly", "--images", str(lot / "images"), "--truth", str(lot / "ground_truth.csv"),
                  "--limit", "10", "--coreset", "500", "--out", str(model)]) == 0
     info = json.loads(capsys.readouterr().out)
-    assert info["path"] == str(model) and (tmp_path / "m.npz").exists() and len(info["hash"]) == 16
+    assert info["path"] == str(tmp_path / "m.npz") and (tmp_path / "m.npz").exists() and len(info["hash"]) == 16
 
     assert main(["gage", "--parts", "3", "--operators", "2", "--trials", "2", "--seed", "1",
                  "--out-json", str(tmp_path / "g.json"), "--out-csv", str(tmp_path / "g.csv")]) == 0
@@ -99,19 +99,16 @@ def test_run_line_cli_uses_env_db(tmp_path, capsys, monkeypatch):
     assert (tmp_path / "env.db").exists() and out["n_inspections"] == 12 and out["control_limits"]["od_mm"]
 
 
-def test_dashboard_renders_headless(tmp_path):
+def test_dashboard_renders_headless(tmp_path, monkeypatch):
     from streamlit.testing.v1 import AppTest
 
     from qinspect.line import run_line
 
     run_line(30, tmp_path / "d.db", seed=4, baseline_subgroups=2)
-    os.environ["QINSPECT_DB"] = str(tmp_path / "d.db")
-    try:
-        at = AppTest.from_file(os.path.join(os.path.dirname(__file__), "..", "src", "qinspect", "dashboard.py"),
-                               default_timeout=90)
-        at.run()
-    finally:
-        os.environ.pop("QINSPECT_DB", None)
+    monkeypatch.setenv("QINSPECT_DB", str(tmp_path / "d.db"))
+    at = AppTest.from_file(os.path.join(os.path.dirname(__file__), "..", "src", "qinspect", "dashboard.py"),
+                           default_timeout=90)
+    at.run()
     assert not at.exception, at.exception
     labels = [m.label for m in at.metric]
     assert "검사 수" in labels and "감사 체인" in labels

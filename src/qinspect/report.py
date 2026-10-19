@@ -110,11 +110,6 @@ def _metrics(df: pd.DataFrame, truth: pd.DataFrame) -> dict:
     tn = int(((m.verdict == VERDICT_PASS) & (m.expected_verdict == "PASS")).sum())
     fp = int(((m.verdict == VERDICT_NG) & (m.expected_verdict == "PASS")).sum())
     fn = int(((m.verdict == VERDICT_PASS) & (m.expected_verdict == "NG")).sum())
-    defect_rows = m[m.defect_type != "none"]
-    expected_kind = defect_rows.defect_type.map(DETECTED_KIND)
-    type_ok = (defect_rows.defect_types.fillna("") == expected_kind).mean() if len(defect_rows) else None
-    grade_ok = (defect_rows.worst_grade.fillna("") == defect_rows.expected_grade.fillna("")).mean() if len(defect_rows) else None
-    od_err = (m.od_mm - m.od_mm_true).dropna()
     out = {
         "n": int(len(m)),
         "n_error_frames": int(len(err)),
@@ -122,25 +117,45 @@ def _metrics(df: pd.DataFrame, truth: pd.DataFrame) -> dict:
         "accuracy": (tp + tn) / max(len(m), 1),
         "escape_rate": fn / max(tp + fn, 1),
         "overkill_rate": fp / max(tn + fp, 1),
-        "defect_type_accuracy": type_ok,
-        "defect_grade_accuracy": grade_ok,
-        "od_measurement_error_mm": {"bias": float(od_err.mean()) if len(od_err) else None,
-                                    "std": float(od_err.std()) if len(od_err) > 1 else None,
-                                    "max_abs": float(od_err.abs().max()) if len(od_err) else None},
         "escaped_serials": m[(m.verdict == VERDICT_PASS) & (m.expected_verdict == "NG")].serial.tolist(),
         "overkill_serials": m[(m.verdict == VERDICT_NG) & (m.expected_verdict == "PASS")].serial.tolist(),
     }
-    if "pocket_mm_true" in m and m.pocket_mm_true.notna().any():
-        pe = (m.pocket_mm - m.pocket_mm_true).dropna()
-        out["pocket_measurement_error_mm"] = {"bias": float(pe.mean()), "std": float(pe.std()) if len(pe) > 1 else None,
-                                              "max_abs": float(pe.abs().max())}
-    if "anomaly_score" in m and m.anomaly_score.notna().any():
+    # the blocks below need columns only the synthetic ground truth provides
+    if "defect_type" in m:
+        defect_rows = m[m.defect_type != "none"]
+        expected_kind = defect_rows.defect_type.map(DETECTED_KIND).fillna(defect_rows.defect_type)
+        out["defect_type_accuracy"] = float((defect_rows.defect_types.fillna("") == expected_kind).mean()) if len(defect_rows) else None
+        if "expected_grade" in m:
+            out["defect_grade_accuracy"] = float((defect_rows.worst_grade.fillna("") == defect_rows.expected_grade.fillna("")).mean()) if len(defect_rows) else None
+    for ch, key in (("od_mm", "od_measurement_error_mm"), ("pocket_mm", "pocket_measurement_error_mm"),
+                    ("concentricity_mm", "concentricity_error_mm")):
+        tcol = f"{ch}_true"
+        if tcol in m and m[tcol].notna().any():
+            e = (m[ch] - m[tcol]).dropna()
+            out[key] = {"bias": float(e.mean()) if len(e) else None, "std": float(e.std()) if len(e) > 1 else None,
+                        "max_abs": float(e.abs().max()) if len(e) else None}
+    if "defect_type" in m and "anomaly_score" in m and m.anomaly_score.notna().any():
         good = m[m.defect_type == "none"].anomaly_score.dropna().to_numpy()
         out["anomaly_auroc_by_defect_type"] = {
             kind: auroc(good, m[m.defect_type == kind].anomaly_score.dropna().to_numpy())
             for kind in sorted(m.defect_type.unique()) if kind != "none"
         }
     return out
+
+
+def load_truth(truth_csv: str | Path) -> pd.DataFrame:
+    """Read a ground-truth CSV; needs at least `serial` and `expected_verdict` (PASS/NG)."""
+    truth_csv = Path(truth_csv)
+    if not truth_csv.exists():
+        raise FileNotFoundError(f"truth csv not found: {truth_csv}")
+    t = pd.read_csv(truth_csv)
+    missing = {"serial", "expected_verdict"} - set(t.columns)
+    if missing:
+        raise ValueError(f"truth csv {truth_csv} lacks columns {sorted(missing)}")
+    bad = set(t.expected_verdict.dropna().unique()) - {"PASS", "NG"}
+    if bad:
+        raise ValueError(f"truth csv expected_verdict must be PASS or NG, got {sorted(bad)}")
+    return t
 
 
 def run_batch(
@@ -163,6 +178,7 @@ def run_batch(
     paths = sorted(p for p in image_dir.iterdir() if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"})
     if not paths:
         raise FileNotFoundError(f"no images in {image_dir}")
+    truth = load_truth(truth_csv) if truth_csv is not None else None  # fail fast, before any record is written
 
     model = AnomalyModel.load(model_path) if model_path else None
     mh = model_hash(model_path) if model_path else None
@@ -230,8 +246,8 @@ def run_batch(
     if "od_mm" in summary["spc"]:
         summary["spc_outer_diameter"] = summary["spc"]["od_mm"]  # backwards-compatible alias
 
-    if truth_csv is not None and Path(truth_csv).exists():
-        summary["vs_ground_truth"] = _metrics(df, pd.read_csv(truth_csv))
+    if truth is not None:
+        summary["vs_ground_truth"] = _metrics(df, truth)
     if db is not None:
         summary["anchor"] = db.anchor_head(f"batch {lot_id}")
         summary["audit"] = db.verify_chain()

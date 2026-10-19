@@ -20,7 +20,8 @@ import numpy as np
 
 from .anomaly import AnomalyModel
 from .db import InspectionDB, image_sha256
-from .inspector import VERDICT_ERROR, VERDICT_PASS, InspectionResult, inspect_array, utc_now
+from .inspector import VERDICT_ERROR, VERDICT_PASS, InspectionResult, inspect_array
+from .util import safe_name, utc_now
 from .spc import RECOMMENDED_BASELINE, ControlLimits, western_electric, xbar_r
 from .spec import PartSpec
 from .synth import DEFECT_TYPES, render_part
@@ -111,6 +112,9 @@ class SpcMonitor:
     _recent_r: deque = field(default_factory=lambda: deque(maxlen=8))
     _n_subgroups: int = 0
 
+    def __post_init__(self):
+        self.baseline_subgroups = max(2, int(self.baseline_subgroups))  # limits need >= 2 subgroups
+
     def add(self, value: float) -> list[dict]:
         if value is None or not np.isfinite(value):
             return []
@@ -125,12 +129,16 @@ class SpcMonitor:
             if self._n_subgroups < self.baseline_subgroups:
                 return []
             chart = xbar_r(np.array(self._phase1), n=self.subgroup)
+            if chart.r_bar <= 0:  # quantised / constant readings: limits would be degenerate, extend Phase I
+                log.warning("SPC Phase I: zero within-subgroup spread after %d subgroups; extending", self._n_subgroups)
+                return []
             self.limits = chart.limits
             self._phase1 = []
             return []  # Phase I points are not alarmed
         self._recent_x.append(float(sg.mean()))
         self._recent_r.append(float(sg.max() - sg.min()))
-        rules = western_electric(np.array(self._recent_x), self.limits.center, self.limits.sigma_xbar)
+        rules = (western_electric(np.array(self._recent_x), self.limits.center, self.limits.sigma_xbar)
+                 if self.limits.sigma_xbar > 0 else {})
         last = len(self._recent_x) - 1
         viol = list(rules.get(last, []))
         r = self._recent_r[-1]
@@ -195,13 +203,19 @@ class Station:
         img_hash = image_sha256(img)
         img_path = None
         if self.image_dir is not None and res.verdict != VERDICT_PASS:  # keep evidence for NG / ERROR frames
-            from PIL import Image
-
-            self.image_dir.mkdir(parents=True, exist_ok=True)
-            img_path = str(self.image_dir / f"{serial}_{img_hash[:8]}.png")
-            Image.fromarray(np.asarray(img)).save(img_path)
+            # file name from a sanitised serial (barcodes may contain '/'), the DB keeps the raw serial
+            img_path = str(self.image_dir / f"{safe_name(serial)}_{img_hash[:8]}.png")
         self.db.add_inspection(res, self.lot_id, self.spec, self.model_hash, self.station_id, operator=self.operator,
                                image_hash=img_hash, image_path=img_path, reinspection_of=reinspection_of)
+        if img_path:
+            try:
+                from PIL import Image
+
+                self.image_dir.mkdir(parents=True, exist_ok=True)
+                Image.fromarray(np.asarray(img)).save(img_path)
+            except OSError as exc:  # evidence storage must never drop the record itself
+                log.error("could not store evidence image %s: %s", img_path, exc)
+                self.db.add_event("evidence_write_failed", {"serial": serial, "path": img_path, "error": str(exc)}, self.lot_id)
         self.bus.publish(f"qinspect/{self.station_id}/result", res.to_row() | {"lot_id": self.lot_id})
 
         if res.verdict == VERDICT_ERROR:  # not a part defect: re-trigger, do not feed SPC / yield

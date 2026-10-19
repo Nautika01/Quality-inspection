@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -19,14 +18,10 @@ from PIL import Image
 
 from . import __version__
 from .spec import PartSpec
+from .util import utc_now
 from .vision import Defect, VisionResult, analyze, to_gray8
 
 VERDICT_PASS, VERDICT_NG, VERDICT_ERROR = "PASS", "NG", "ERROR"
-
-
-def utc_now() -> str:
-    """Single timestamp format for the whole system: ISO-8601 UTC with 'Z'."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @dataclass
@@ -142,13 +137,16 @@ def apply_anomaly(res: InspectionResult, img: np.ndarray, model) -> InspectionRe
         return res
     try:
         flagged, score = model.predict(img)
+        # contract: predict(img) -> (bool, float); accept numpy scalars / 1-element arrays, reject anything else
+        score = float(np.asarray(score, dtype=float).reshape(()))
+        flagged = bool(np.asarray(flagged).reshape(()))
     except Exception as exc:  # noqa: BLE001 - a model failure must not take the line down
         res.anomaly_error = f"{type(exc).__name__}: {exc}"[:200]
         return res
-    if score is None or not math.isfinite(float(score)):
+    if not math.isfinite(score):
         res.anomaly_error = "non-finite score"
         return res
-    res.anomaly_score = round(float(score), 3)
+    res.anomaly_score = round(score, 3)
     if flagged and res.verdict == VERDICT_PASS and not res.defects:
         res.verdict = VERDICT_NG
         res.reasons = res.reasons + ["anomaly_score"]

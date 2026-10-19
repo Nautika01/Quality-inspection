@@ -46,7 +46,8 @@ def load_gray(path: str | Path, size: int | None = None) -> np.ndarray:
 
 
 def list_images(folder: str | Path) -> list[Path]:
-    return sorted(p for p in Path(folder).iterdir() if p.suffix.lower() in IMG_EXT and not p.name.startswith("."))
+    return sorted(p for p in Path(folder).iterdir()
+                  if p.is_file() and p.suffix.lower() in IMG_EXT and not p.name.startswith("."))
 
 
 def import_images(src: str | Path, dst: str | Path, *, size: int | None = None, prefix: str = "IMP") -> list[Path]:
@@ -68,25 +69,32 @@ def import_images(src: str | Path, dst: str | Path, *, size: int | None = None, 
     existing = [p for p in out.glob(f"{prefix}-*.png")]
     next_idx = 1 + max((int(p.stem.rsplit("-", 1)[1]) for p in existing if p.stem.rsplit("-", 1)[1].isdigit()), default=0)
 
+    import warnings
+
     written = []
-    new_rows = []
-    for p in list_images(src):
-        digest = hashlib.sha256(p.read_bytes()).hexdigest()
-        if digest in seen:
-            continue
-        serial = f"{prefix}-{next_idx:05d}"
-        next_idx += 1
-        Image.fromarray(load_gray(p, size)).save(out / f"{serial}.png")
-        written.append(out / f"{serial}.png")
-        new_rows.append({"serial": serial, "source": str(p), "sha256": digest})
-        seen[digest] = serial
-    if new_rows:
-        new = not manifest.exists()
-        with manifest.open("a", newline="", encoding="utf-8") as fh:
-            w = csv.DictWriter(fh, fieldnames=["serial", "source", "sha256"])
-            if new:
-                w.writeheader()
-            w.writerows(new_rows)
+    new = not manifest.exists()
+    with manifest.open("a", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=["serial", "source", "sha256"])
+        if new:
+            w.writeheader()
+            fh.flush()
+        for p in list_images(src):
+            digest = hashlib.sha256(p.read_bytes()).hexdigest()
+            if digest in seen:
+                continue
+            try:
+                arr = load_gray(p, size)
+            except Exception as exc:  # noqa: BLE001 - one bad photo must not abort the batch
+                warnings.warn(f"import: skipping unreadable {p.name}: {exc}", stacklevel=2)
+                continue
+            serial = f"{prefix}-{next_idx:05d}"
+            next_idx += 1
+            Image.fromarray(arr).save(out / f"{serial}.png")
+            # PNG first, then its manifest row, flushed at once: the two can never be separated
+            w.writerow({"serial": serial, "source": str(p), "sha256": digest})
+            fh.flush()
+            written.append(out / f"{serial}.png")
+            seen[digest] = serial
     return written
 
 

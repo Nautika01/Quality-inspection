@@ -6,15 +6,19 @@
 
 ```bash
 # 인터넷 가능한 빌드 PC
-docker build -t qinspect:0.3 .
-docker save qinspect:0.3 | gzip > qinspect-0.3.tar.gz
-sha256sum qinspect-0.3.tar.gz > qinspect-0.3.tar.gz.sha256
+docker build -t qinspect:0.3 .                       # requirements-lock.txt 기준으로 설치
+docker pull eclipse-mosquitto:2                      # (선택) MQTT 브로커 — compose의 mqtt 프로필이 쓰는 이미지
+docker save qinspect:0.3 eclipse-mosquitto:2 | gzip > qinspect-0.3-bundle.tar.gz   # 두 이미지를 한 번들로
+sha256sum qinspect-0.3-bundle.tar.gz > qinspect-0.3-bundle.tar.gz.sha256
 
 # 폐쇄망 서버 (매체 반입 후)
-sha256sum -c qinspect-0.3.tar.gz.sha256
-docker load < qinspect-0.3.tar.gz
-docker compose up -d        # api :8000, dashboard :8501, mqtt :1883  (compose는 image: qinspect:0.3 을 그대로 씀)
+sha256sum -c qinspect-0.3-bundle.tar.gz.sha256
+docker load < qinspect-0.3-bundle.tar.gz
+docker compose up -d                 # api :8000, dashboard :8501  (compose는 image: qinspect:0.3 을 그대로 씀, pull 없음)
+docker compose --profile mqtt up -d  # 브로커까지 띄울 때 (:1883)
 ```
+
+> 기존 `/data/qinspect.db`(v0.2)는 첫 접속 때 자동으로 v0.3 스키마로 마이그레이션됩니다(컬럼 추가·`prev_hash` UNIQUE·구버전 레코드는 구버전 해시 규칙으로 계속 검증). 업그레이드 전에 파일을 백업하고 `qinspect audit`으로 체인이 정상인지 확인하세요.
 
 - 컨테이너는 비루트(uid 1000) 사용자로 실행되며 `/data` 볼륨에 DB·증거 이미지가 남습니다. 호스트 디렉터리를 바인드 마운트하면 `chown -R 1000 <dir>` 이 필요합니다.
 - `HEALTHCHECK`가 API `/health`, 대시보드 `/_stcore/health`를 확인합니다. `/health` 응답의 `spec_hash`, `model_hash`, `auth`로 배포된 규격·모델·인증 상태를 확인하세요.
@@ -32,7 +36,7 @@ pip install --no-index --find-links dist/offline -r requirements-lock.txt qinspe
 qinspect serve --db /data/qinspect.db --api-key "$(cat /etc/qinspect/api.key)"
 ```
 
-`requirements-lock.txt`는 검증된 의존성 버전을 고정합니다(Python 3.13 기준 생성). 다른 파이썬 버전이면 빌드 PC에서 `pip freeze`로 다시 만들고 테스트를 돌린 뒤 반입하세요.
+`requirements-lock.txt`는 검증된 의존성 버전을 고정합니다(Python 3.13 기준 생성, Docker 이미지도 같은 파일로 설치). 다른 파이썬 버전이면 빌드 PC에서 `pip freeze`로 다시 만들고 테스트를 돌린 뒤 반입하세요.
 
 ## 운영 체크리스트
 
@@ -59,4 +63,4 @@ qinspect serve --db /data/qinspect.db --api-key "$(cat /etc/qinspect/api.key)"
 | `QINSPECT_API_KEY` | 쓰기 API 보호 키 (`X-API-Key`) | 없음(모두 허용) |
 | `QINSPECT_IMAGE_DIR` | NG/ERROR 프레임 증거 저장 폴더 | 저장 안 함 |
 | `QINSPECT_MAX_UPLOAD_MB` | `/inspect` 업로드 상한 | 20 |
-| `QINSPECT_TZ` | 대시보드·export 표시 시간대 | `Asia/Seoul` |
+| `QINSPECT_TZ` | 대시보드·`export` 표시 시간대 (`--tz`가 우선) | `Asia/Seoul` |

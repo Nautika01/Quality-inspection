@@ -109,26 +109,33 @@ def zero_acceptance_plan(lot_size: int, limiting_quality: float, confidence: flo
     if lot_size < 1:
         raise ValueError("lot size must be >= 1")
     D = max(1, math.ceil(Fraction(str(limiting_quality)) * lot_size))  # exact, no float round-up
+    conf = Fraction(str(confidence))
+    # P(0 defective in a sample of n) = prod_{i<n} (N-D-i)/(N-i), updated exactly one draw at a time
+    num, den = 1, 1
     for n in range(1, lot_size + 1):
-        # P(0 defective in sample | D defective in lot)
-        p0 = math.comb(lot_size - D, n) / math.comb(lot_size, n) if n <= lot_size - D else 0.0
-        if 1 - p0 >= confidence:
-            return SamplingPlan("accept-on-zero (c=0)", lot_size, None, n, 0, 1,
-                                note=f"LQ={limiting_quality:.3%}, confidence={confidence:.0%}, D={D}")
-    return SamplingPlan("accept-on-zero (c=0)", lot_size, None, lot_size, 0, 1, note="100 % inspection")
+        num *= lot_size - D - n + 1  # hits 0 once the sample must contain a defective
+        den *= lot_size - n + 1
+        if 1 - Fraction(num, den) >= conf:
+            note = f"LQ={limiting_quality:.3%}, confidence={confidence:.0%}, D={D}"
+            if n == lot_size:
+                note += "; sample >= lot: 100 % inspection"
+            return SamplingPlan("accept-on-zero (c=0)", lot_size, None, n, 0, 1, note=note)
+    raise AssertionError("unreachable: n = lot_size always rejects a lot with D >= 1 defectives")
 
 
 def oc_curve(plan: SamplingPlan, p: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Operating characteristic: P(accept) vs fraction defective.
 
     Exact hypergeometric for the finite lot the plan was built for; binomial would
-    overstate the risk for small lots.
+    overstate the risk for small lots. `p` is a lower bound on the lot fraction
+    defective, i.e. D = ceil(p * N) - the same convention `zero_acceptance_plan` sizes with,
+    so a plan's own curve reproduces its stated confidence at p = LQ.
     """
     from scipy import stats
 
     p = np.linspace(0, 0.2, 201) if p is None else np.asarray(p, dtype=float)
     N, n, c = plan.lot_size, plan.sample_size, plan.accept
-    D = np.round(p * N).astype(int)
+    D = np.ceil(p * N - 1e-9).astype(int)
     pa = stats.hypergeom.cdf(c, N, D, n)
     return p, np.asarray(pa, dtype=float)
 

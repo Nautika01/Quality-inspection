@@ -134,10 +134,10 @@ class AnomalyModel:
         return s > self.threshold, s
 
     def save(self, path: str | Path, meta: dict | None = None) -> str:
-        """Write the model; returns its content hash. The path always gets a .npz suffix."""
-        path = Path(path)
-        if path.suffix != ".npz":
-            path = path.with_suffix(path.suffix + ".npz")
+        """Write the model; returns its content hash. The path always gets a .npz suffix
+        (the resolved location is available afterwards as `self.path`)."""
+        path = model_file(path)
+        self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("wb") as fh:
             np.savez_compressed(fh, bank=self.bank.astype(np.float32), mu=self.mu.astype(np.float64),
@@ -155,8 +155,14 @@ class AnomalyModel:
                    int(z["size"]), has_pocket)
 
 
+def model_file(path: str | Path) -> Path:
+    """The file a model is (or will be) saved to: always with a .npz suffix."""
+    p = Path(path)
+    return p if p.suffix == ".npz" else p.with_suffix(p.suffix + ".npz")
+
+
 def model_hash(path: str | Path) -> str:
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:16]
+    return hashlib.sha256(model_file(path).read_bytes()).hexdigest()[:16]
 
 
 MIN_TRAIN_IMAGES = 4
@@ -174,7 +180,13 @@ def train(good_images: list[np.ndarray], *, coreset: int = 4000, k: int = 1, see
     """
     import warnings
 
+    if names is not None and len(names) not in (0, len(good_images)):
+        raise ValueError(f"names must have one entry per image ({len(names)} names, {len(good_images)} images)")
     names = names or [f"image[{i}]" for i in range(len(good_images))]
+    if k < 1:
+        raise ValueError("k must be >= 1")
+    if k > coreset:
+        raise ValueError(f"k ({k}) cannot exceed coreset ({coreset})")
     # drop exact duplicates (same bytes) - they would make held-out scores meaningless
     uniq, seen = [], set()
     for im, nm in zip(good_images, names):
@@ -189,8 +201,6 @@ def train(good_images: list[np.ndarray], *, coreset: int = 4000, k: int = 1, see
     if len(uniq) < RECOMMENDED_TRAIN_IMAGES:
         warnings.warn(f"train: only {len(uniq)} images; threshold estimate is rough (recommend >= {RECOMMENDED_TRAIN_IMAGES})",
                       stacklevel=2)
-    if k < 1:
-        raise ValueError("k must be >= 1")
     rng = np.random.default_rng(seed)
     per_image = []
     for im, nm in uniq:
@@ -209,8 +219,9 @@ def train(good_images: list[np.ndarray], *, coreset: int = 4000, k: int = 1, see
     folds = np.arange(len(Z)) % 2
     for f in (0, 1):
         bank_f = np.concatenate([z for z, g in zip(Z, folds) if g != f])
-        kk = min(k, len(bank_f))
-        tree = cKDTree(bank_f[_greedy_coreset(bank_f, coreset, rng)])
+        sel = _greedy_coreset(bank_f, coreset, rng)
+        kk = min(k, len(sel))
+        tree = cKDTree(bank_f[sel])
         for i in np.nonzero(folds == f)[0]:
             d, _ = tree.query(Z[i], k=kk)
             d = d if kk == 1 else d.mean(1)

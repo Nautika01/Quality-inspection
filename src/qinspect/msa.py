@@ -89,9 +89,9 @@ def gage_rr_anova(df: pd.DataFrame, tolerance: float, characteristic: str = "val
     ss_part = o * r * ((part_means - grand) ** 2).sum()
     ss_op = p * r * ((op_means - grand) ** 2).sum()
     ss_cell = r * ((cell_means - grand) ** 2).sum()
-    ss_inter = ss_cell - ss_part - ss_op
+    ss_inter = max(ss_cell - ss_part - ss_op, 0.0)
     ss_total = ((df.value - grand) ** 2).sum()
-    ss_rep = ss_total - ss_cell
+    ss_rep = max(ss_total - ss_cell, 0.0)
 
     ms_part = ss_part / (p - 1)
     ms_op = ss_op / (o - 1)
@@ -101,8 +101,11 @@ def gage_rr_anova(df: pd.DataFrame, tolerance: float, characteristic: str = "val
     # F-test on the interaction (alpha = 0.25 per AIAG); pool it if not significant
     from scipy import stats
 
-    f_inter = ms_inter / ms_rep if ms_rep > 0 else 0.0
-    p_inter = 1 - stats.f.cdf(f_inter, (p - 1) * (o - 1), p * o * (r - 1))
+    if ms_rep > 0:
+        p_inter = float(stats.f.sf(ms_inter / ms_rep, (p - 1) * (o - 1), p * o * (r - 1)))
+    else:  # zero repeatability (resolution-limited gauge): F is +inf whenever the interaction MS is non-zero
+        p_inter = 0.0 if ms_inter > 0 else 1.0
+        warnings.warn("gage_rr_anova: repeat readings are identical; gauge resolution may be too coarse", stacklevel=2)
     if p_inter < 0.25:
         var_rep = ms_rep
         var_inter = max((ms_inter - ms_rep) / r, 0.0)
@@ -120,6 +123,12 @@ def gage_rr_anova(df: pd.DataFrame, tolerance: float, characteristic: str = "val
     grr = float(np.sqrt(ev**2 + av**2))
     pv = float(np.sqrt(var_part))
     tv = float(np.sqrt(grr**2 + pv**2))
+    if tv == 0:
+        raise ValueError("study has no variation: every reading is identical (gauge resolution too coarse for this study)")
+    if grr == 0:
+        ndc = 99 if pv > 0 else 0
+    else:
+        ndc = max(int(np.floor(1.41 * pv / grr)), 0)
     return GageRR(
         characteristic=characteristic,
         n_parts=p,
@@ -130,9 +139,9 @@ def gage_rr_anova(df: pd.DataFrame, tolerance: float, characteristic: str = "val
         grr=grr,
         part_variation=pv,
         total_variation=tv,
-        pct_grr_tv=100 * grr / tv if tv > 0 else float("nan"),
+        pct_grr_tv=100 * grr / tv,
         pct_grr_tol=100 * 6 * grr / tolerance,
-        ndc=max(int(np.floor(1.41 * pv / grr)) if grr > 0 else 99, 0),
+        ndc=ndc,
         tolerance=tolerance,
     )
 

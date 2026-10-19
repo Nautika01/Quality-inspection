@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qinspect"
-version = "0.3.0"
+version = "0.3.1"
 description = "Smart-factory quality inspection for precision defense parts: vision, anomaly detection, SPC, MSA, traceability"
 readme = "README.md"
 requires-python = ">=3.10"

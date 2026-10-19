@@ -14,7 +14,7 @@
 ```bash
 pip install -e ".[dev]"
 qinspect demo --out runs/demo        # 생성 → 이상탐지 학습 → 하이브리드 검사 → Gage R&R → 검사 기준서 (약 1분)
-pytest                               # 96개 테스트 (~50 s)
+pytest                               # 111개 테스트 (~70 s)
 ```
 
 `runs/demo/` 에 `results.csv`, `summary.json`, `spc_od_mm.png`, `spc_pocket_mm.png`, `overlays/`, `qinspect.db`(감사 체인·앵커 포함), `anomaly_model.npz`, `gage_rr.json`, `inspection_standard.md` 가 생깁니다.

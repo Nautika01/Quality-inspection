@@ -23,8 +23,9 @@ services:
       timeout: 5s
       retries: 3
     depends_on: [api]
-  mqtt:
+  mqtt:  # optional broker: `docker compose --profile mqtt up -d`; ship its image in the offline bundle too
     image: eclipse-mosquitto:2
+    profiles: ["mqtt"]
     ports: ["1883:1883"]
     command: ["mosquitto", "-c", "/mosquitto-no-auth.conf"]
 volumes:

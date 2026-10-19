@@ -98,8 +98,8 @@ def to_gray8(img: np.ndarray) -> np.ndarray:
         raise VisionError("bad_image", "non-finite pixel values")
     if src.kind in "fc":
         peak = a.max()
-        if peak <= 1.0:  # floats in [0, 1]
-            a = a * 255.0
+        if peak <= 4.0:  # unit-range data, tolerating white-balance / HDR overshoot above 1.0
+            a = np.clip(a, 0.0, 1.0) * 255.0
         elif peak > 255.0:
             a = a * 255.0 / peak
     elif src.kind in "iu" and src.itemsize > 1:  # 10/12/14/16-bit data in wider integer containers
@@ -242,17 +242,36 @@ def measure_outer(img: np.ndarray) -> tuple[Circle, np.ndarray, bool]:
     return _subpixel_disk(img8, part), part, bright
 
 
-def _find_pocket(img8: np.ndarray, part: np.ndarray, outer: Circle, bright_part: bool) -> Circle:
-    face = ndi.binary_erosion(part, iterations=4)
+def _fit_circle_robust(ys: np.ndarray, xs: np.ndarray, tol_px: float = 2.0, max_iter: int = 10):
+    """Algebraic (Kasa) least-squares circle through boundary points, iteratively dropping
+    outliers more than `tol_px` from the fit. Returns (cx, cy, r, inlier_mask)."""
+    keep = np.ones(len(xs), dtype=bool)
+    cx = cy = r = float("nan")
+    for _ in range(max_iter):
+        x, y = xs[keep], ys[keep]
+        if len(x) < 6:
+            raise VisionError("pocket_degenerate", "too few boundary points")
+        A = np.column_stack([x, y, np.ones_like(x)])
+        b = x * x + y * y
+        (a1, a2, a3), *_ = np.linalg.lstsq(A, b, rcond=None)
+        cx, cy = a1 / 2, a2 / 2
+        r = float(np.sqrt(max(a3 + cx * cx + cy * cy, 1e-9)))
+        resid = np.abs(np.hypot(xs - cx, ys - cy) - r)
+        new_keep = resid <= tol_px
+        if new_keep.sum() == keep.sum() and (new_keep == keep).all():
+            break
+        keep = new_keep
+    return float(cx), float(cy), r, keep
+
+
+def _pocket_candidate(img8: np.ndarray, face: np.ndarray, outer: Circle, darker: bool) -> np.ndarray | None:
+    """Largest plausible recess component (darker or brighter than the face) near the part centre."""
     fv = img8[face]
-    if fv.size < 50:
-        raise VisionError("pocket_not_found", "face too small")
     thr = otsu_threshold(fv)
-    # a pocket is a recess: darker than the face on a bright part, brighter on a dark part
-    cand = face & ((img8 < thr) if bright_part else (img8 > thr))
+    cand = face & ((img8 < thr) if darker else (img8 > thr))
     labels, n = ndi.label(cand, structure=_EIGHT)
     if n == 0:
-        raise VisionError("pocket_not_found")
+        return None
     ci, cj = int(round(outer.cy)), int(round(outer.cx))
     lab = labels[ci, cj] if (0 <= ci < labels.shape[0] and 0 <= cj < labels.shape[1]) else 0
     if lab == 0:  # pocket may be off-centre: take the component whose centroid is nearest the centre
@@ -260,17 +279,46 @@ def _find_pocket(img8: np.ndarray, part: np.ndarray, outer: Circle, bright_part:
         sizes = ndi.sum(cand, labels, index=np.arange(1, n + 1))
         ok = sizes >= 30
         if not ok.any():
-            raise VisionError("pocket_not_found", "no component >= 30 px")
+            return None
         d = np.hypot(cents[:, 1] - outer.cx, cents[:, 0] - outer.cy)
         d[~ok] = np.inf
         lab = int(np.argmin(d)) + 1
     pocket = ndi.binary_fill_holes(labels == lab)
-    if pocket.sum() < 30:
-        raise VisionError("pocket_not_found", f"component {int(pocket.sum())} px")
-    face_level = float(np.median(img8[face & ~ndi.binary_dilation(pocket, iterations=6)]))
+    if pocket.sum() < 30 or pocket.sum() > 0.8 * face.sum():  # nothing, or the whole face (wrong polarity)
+        return None
+    return pocket
+
+
+def _find_pocket(img8: np.ndarray, part: np.ndarray, outer: Circle, bright_part: bool) -> Circle:
+    face = ndi.binary_erosion(part, iterations=4)
+    if face.sum() < 50:
+        raise VisionError("pocket_not_found", "face too small")
+    # a recess is normally darker than the face on a bright part (brighter on a dark part);
+    # fall back to the other polarity before giving up (through-holes on a light table, odd lighting)
+    pocket = _pocket_candidate(img8, face, outer, darker=bright_part)
+    if pocket is None:
+        pocket = _pocket_candidate(img8, face, outer, darker=not bright_part)
+    if pocket is None:
+        raise VisionError("pocket_not_found", "no recess component inside the face")
+    ref = face & ~ndi.binary_dilation(pocket, iterations=6)
+    if ref.sum() < 50:
+        raise VisionError("pocket_not_found", "candidate covers the face")
+    face_level = float(np.median(img8[ref]))
     pocket_level = float(np.median(img8[pocket]))
     if abs(face_level - pocket_level) < 15:
         raise VisionError("pocket_not_found", f"face/pocket contrast {abs(face_level - pocket_level):.0f}")
+
+    # a dark defect touching the rim merges into the component: fit the boundary robustly and
+    # keep only the circular part of the mask before the sub-pixel measurement
+    boundary = pocket & ~ndi.binary_erosion(pocket)
+    by, bx = np.nonzero(boundary)
+    fcx, fcy, fr, inl = _fit_circle_robust(by.astype(float), bx.astype(float))
+    outlier_frac = 1.0 - inl.mean()
+    if outlier_frac > 0.35:
+        raise VisionError("pocket_degenerate", f"pocket boundary not circular ({outlier_frac:.0%} outliers)")
+    if outlier_frac > 0.02:
+        yy, xx = np.indices(img8.shape)
+        pocket = pocket & (np.hypot(xx - fcx, yy - fcy) <= fr + 1.0)
     c = _subpixel_disk(img8, pocket)
     ratio = c.r / outer.r
     if not (0.05 < ratio < 0.9):
@@ -316,7 +364,7 @@ def _extent_px(xs: np.ndarray, ys: np.ndarray, weights: np.ndarray) -> tuple[flo
     """(length, elongation) of a blob: length = extent along the principal axis of the
     *weighted* pixel set, elongation = sqrt(ratio of principal variances)."""
     if len(xs) < 3:
-        return float(max(xs.ptp(), ys.ptp()) + 1), 1.0
+        return float(max(np.ptp(xs), np.ptp(ys)) + 1), 1.0
     w = weights / weights.sum()
     mx, my = (w * xs).sum(), (w * ys).sum()
     dx, dy = xs - mx, ys - my

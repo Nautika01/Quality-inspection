@@ -141,7 +141,8 @@ def _cmd_train_anomaly(a):
     model = train([load_gray(p) for p in paths], coreset=a.coreset, k=a.k, seed=a.seed,
                   threshold_sigma=a.threshold_sigma, has_pocket=spec.has_pocket, names=[p.name for p in paths])
     mh = model.save(a.out, {"trained_on": [p.name for p in paths]})
-    _print({"n_train": len(paths), "threshold": model.threshold, "bank": list(model.bank.shape), "hash": mh, "path": a.out})
+    _print({"n_train": len(paths), "threshold": model.threshold, "bank": list(model.bank.shape), "hash": mh,
+            "path": str(model.path)})
 
 
 def _cmd_anomaly_eval(a):
@@ -182,6 +183,7 @@ def _cmd_anomaly_eval(a):
         out["auroc_all"] = auroc(good, np.concatenate(all_bad))
     if a.save_model and not a.model:
         out["model_hash"] = model.save(a.save_model)
+        out["model_path"] = str(model.path)
     _print(out)
 
 
@@ -247,8 +249,6 @@ def _cmd_dashboard(a):
     import subprocess
 
     env = os.environ | {"QINSPECT_DB": _db_path(a.db)}
-    if a.spec:
-        env["QINSPECT_SPEC"] = a.spec
     if a.tz:
         env["QINSPECT_TZ"] = a.tz
     script = Path(__file__).with_name("dashboard.py")
@@ -304,12 +304,21 @@ def _cmd_audit(a):
 def _cmd_export(a):
     import pandas as pd
 
+    from .util import utc_param
+
+    try:
+        since, until = utc_param(a.since, "--since"), utc_param(a.until, "--until")
+    except ValueError as exc:
+        sys.exit(f"error: {exc}")
+    if since and until and since >= until:
+        sys.exit("error: --since must be earlier than --until")
+    tz = a.tz or os.environ.get("QINSPECT_TZ", "Asia/Seoul")
     with _open_db(_db_path(a.db)) as db:
-        rows = db.inspections(a.lot, since=a.since, until=a.until, station=a.station)
-        summary = db.lot_summary(a.lot, since=a.since, until=a.until, station=a.station) if a.lot else None
+        rows = db.inspections(a.lot, since=since, until=until, station=a.station)
+        summary = db.lot_summary(a.lot, since=since, until=until, station=a.station) if a.lot else None
     df = pd.DataFrame(rows)
-    if a.tz and len(df):
-        df["inspected_at_local"] = pd.to_datetime(df.inspected_at, utc=True).dt.tz_convert(a.tz).dt.strftime("%Y-%m-%d %H:%M:%S")
+    if len(df):
+        df["inspected_at_local"] = pd.to_datetime(df.inspected_at, utc=True).dt.tz_convert(tz).dt.strftime("%Y-%m-%d %H:%M:%S")
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     if a.out.endswith(".json"):
         from .report import write_json
@@ -352,6 +361,13 @@ def _cmd_disposition(a):
             sys.exit("error: --inspection-id is required (or --list)")
         did = db.add_disposition(a.inspection_id, a.decision, a.by, a.note, a.mrb_ref)
     _print({"id": did, "inspection_id": a.inspection_id, "decision": a.decision})
+
+
+def _min2(v: str) -> int:
+    n = int(v)
+    if n < 2:
+        raise argparse.ArgumentTypeError("must be >= 2 (control limits need at least two subgroups)")
+    return n
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -420,7 +436,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bus", default="memory", help="memory | mqtt://host:port"); p.add_argument("--rate", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=0); p.add_argument("--lot", default="LOT-SIM")
     p.add_argument("--model"); p.add_argument("--spec"); p.add_argument("--operator")
-    p.add_argument("--baseline", type=int, default=25, help="Phase I subgroups when no frozen limits exist")
+    p.add_argument("--baseline", type=_min2, default=25, help="Phase I subgroups when no frozen limits exist (>= 2)")
     p.add_argument("--image-dir", help="keep NG/ERROR frames here as evidence")
     p.add_argument("--freeze-by", help="freeze the resulting control limits in the DB under this name")
     p.add_argument("-v", "--verbose", action="store_true"); p.set_defaults(fn=_cmd_run_line)
@@ -430,8 +446,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--spec"); p.add_argument("--model"); p.add_argument("--api-key", help="require X-API-Key on writes")
     p.add_argument("--image-dir"); p.set_defaults(fn=_cmd_serve)
 
-    p = sub.add_parser("dashboard", help="Streamlit dashboard")
-    add_db(p); p.add_argument("--port", type=int, default=8501); p.add_argument("--spec")
+    p = sub.add_parser("dashboard", help="Streamlit dashboard (shows each lot against the spec it was inspected with)")
+    add_db(p); p.add_argument("--port", type=int, default=8501)
     p.add_argument("--tz", help="display time zone, e.g. Asia/Seoul (default $QINSPECT_TZ or Asia/Seoul)")
     p.set_defaults(fn=_cmd_dashboard)
 
@@ -453,8 +469,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("export", help="export inspections for a lot / station / time window (shift report)")
     add_db(p); p.add_argument("--lot"); p.add_argument("--station")
-    p.add_argument("--since", help="ISO-8601 UTC, e.g. 2026-10-14T00:00:00Z"); p.add_argument("--until")
-    p.add_argument("--tz", default="Asia/Seoul"); p.add_argument("--out", required=True, help=".csv or .json")
+    p.add_argument("--since", help="ISO-8601, e.g. 2026-10-14T00:00:00Z or 2026-10-14T09:00:00+09:00"); p.add_argument("--until")
+    p.add_argument("--tz", help="local time zone for inspected_at_local (default $QINSPECT_TZ or Asia/Seoul)")
+    p.add_argument("--out", required=True, help=".csv or .json")
     p.set_defaults(fn=_cmd_export)
 
     p = sub.add_parser("lot-close", help="acceptance sampling on a lot's results + record the lot disposition")
