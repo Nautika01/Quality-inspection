@@ -83,14 +83,103 @@ class MqttBus:
         self.client.disconnect()
 
 
+class OpcUaBus:
+    """Writes results / alarms into an OPC UA server (PLC, SCADA gateway) with `asyncua`.
+
+    Topic `qinspect/<station>/<kind>` maps to the variable `Objects/<root>/<station>/<kind>`
+    (JSON string). For results the typed variables `Serial`, `Verdict`, `OdMm`, `PocketMm`,
+    `ConcentricityMm`, `Reasons` under the station object are written too, so a PLC can
+    branch on them without parsing JSON. Missing nodes are created when the server allows it.
+    """
+
+    def __init__(self, url: str = "opc.tcp://localhost:4840", root: str = "qinspect",
+                 namespace: str = "urn:qinspect", timeout: float = 5.0):
+        try:
+            from asyncua.sync import Client
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError("OPC UA bus needs `pip install asyncua`") from exc
+        self.errors = 0
+        self.root, self.namespace = root, namespace
+        self.client = Client(url, timeout=timeout)
+        try:
+            self.client.connect()
+        except Exception as exc:  # noqa: BLE001
+            self._stop_loop()
+            raise ConnectionError(f"OPC UA server {url} unreachable: {exc}") from exc
+        try:
+            self.idx = self.client.get_namespace_index(namespace)
+        except Exception as exc:  # noqa: BLE001
+            self.close()
+            raise ConnectionError(f"OPC UA server has no namespace {namespace!r}: {exc}") from exc
+        self._nodes: dict[tuple[str, ...], object] = {}
+
+    def _stop_loop(self) -> None:
+        """asyncua.sync runs a non-daemon event-loop thread; stop it so processes can exit."""
+        try:
+            self.client.tloop.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _var(self, path: tuple[str, ...], initial):
+        """Variable node `Objects/<path>`; created when missing *and* the server allows it
+        (a PLC normally pre-defines the tags, in which case we only write)."""
+        if path in self._nodes:
+            return self._nodes[path]
+        node = self.client.nodes.objects
+        for i, name in enumerate(path):
+            qn = f"{self.idx}:{name}"
+            try:
+                node = node.get_child(qn)
+            except Exception:  # noqa: BLE001 - missing: try to create (BadUserAccessDenied if not allowed)
+                node = node.add_variable(self.idx, name, initial) if i == len(path) - 1 else node.add_object(self.idx, name)
+                if i == len(path) - 1:
+                    node.set_writable()
+        self._nodes[path] = node
+        return node
+
+    def publish(self, topic: str, payload: dict) -> bool:
+        try:
+            parts = topic.split("/")  # qinspect/<station>/<kind>
+            station, kind = (parts[1], parts[2]) if len(parts) >= 3 else ("line", parts[-1])
+            body = json.dumps(payload, ensure_ascii=False, default=str)
+            self._var((self.root, station, kind), "").write_value(body)
+            if kind == "result":
+                for name, key, default in (("Serial", "serial", ""), ("Verdict", "verdict", ""), ("Reasons", "reasons", ""),
+                                           ("OdMm", "od_mm", 0.0), ("PocketMm", "pocket_mm", 0.0),
+                                           ("ConcentricityMm", "concentricity_mm", 0.0)):
+                    v = payload.get(key)
+                    v = default if v is None else (float(v) if isinstance(default, float) else str(v))
+                    self._var((self.root, station, name), default).write_value(v)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self.errors += 1
+            log.warning("OPC UA write failed topic=%s: %s", topic, exc)
+            return False
+
+    def close(self) -> None:
+        try:
+            self.client.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+        self._stop_loop()
+
+
 def make_bus(url: str | None):
-    """`None` / `memory` -> InMemoryBus, `mqtt://host[:port]` -> MqttBus."""
+    """`None` / `memory` -> InMemoryBus, `mqtt://host[:port]` -> MqttBus,
+    `opc.tcp://host:port/endpoint?root=<object>&ns=<namespace-uri>` -> OpcUaBus."""
     if not url or url == "memory":
         return InMemoryBus()
     if url.startswith("mqtt://"):
         hostport = url[len("mqtt://"):]
         host, _, port = hostport.partition(":")
         return MqttBus(host or "localhost", int(port or 1883))
+    if url.startswith("opc.tcp://"):
+        from urllib.parse import parse_qs, urlsplit
+
+        parts = urlsplit(url)
+        q = parse_qs(parts.query)
+        endpoint = parts._replace(query="", fragment="").geturl()
+        return OpcUaBus(endpoint, root=q.get("root", ["qinspect"])[0], namespace=q.get("ns", ["urn:qinspect"])[0])
     raise ValueError(f"unknown bus url: {url}")
 
 

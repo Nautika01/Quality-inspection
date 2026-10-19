@@ -139,10 +139,11 @@ def _cmd_train_anomaly(a):
     if a.limit:
         paths = paths[: a.limit]
     model = train([load_gray(p) for p in paths], coreset=a.coreset, k=a.k, seed=a.seed,
-                  threshold_sigma=a.threshold_sigma, has_pocket=spec.has_pocket, names=[p.name for p in paths])
-    mh = model.save(a.out, {"trained_on": [p.name for p in paths]})
-    _print({"n_train": len(paths), "threshold": model.threshold, "bank": list(model.bank.shape), "hash": mh,
-            "path": str(model.path)})
+                  threshold_sigma=a.threshold_sigma, has_pocket=spec.has_pocket, names=[p.name for p in paths],
+                  backend=a.backend)
+    mh = model.save(a.out, {"trained_on": [p.name for p in paths], "backend": a.backend})
+    _print({"n_train": len(paths), "backend": a.backend, "threshold": model.threshold, "bank": list(model.bank.shape),
+            "hash": mh, "path": str(model.path)})
 
 
 def _cmd_anomaly_eval(a):
@@ -240,6 +241,8 @@ def _cmd_serve(a):
         os.environ["QINSPECT_MODEL"] = a.model
     if a.api_key:
         os.environ["QINSPECT_API_KEY"] = a.api_key
+    if a.api_keys:
+        os.environ["QINSPECT_API_KEYS"] = a.api_keys
     if a.image_dir:
         os.environ["QINSPECT_IMAGE_DIR"] = a.image_dir
     uvicorn.run("qinspect.api:create_app", factory=True, host=a.host, port=a.port, reload=False)
@@ -370,6 +373,70 @@ def _min2(v: str) -> int:
     return n
 
 
+def _cmd_anomaly_compare(a):
+    from .anomaly import compare_backends
+    from .datasets import AnomalyDataset, load_gray
+
+    ds = AnomalyDataset.from_root(a.dataset)
+    good = [load_gray(p, a.size) for p in ds.train_good[: a.limit or None]]
+    test_good = [load_gray(p, a.size) for p in ds.test_good[: a.limit or None]]
+    bad = {cls: [load_gray(p, a.size) for p in paths[: a.limit or None]] for cls, paths in ds.test_bad.items()}
+    _print(compare_backends(good, test_good, bad, coreset=a.coreset, seed=a.seed))
+
+
+def _cmd_capture(a):
+    from .capture import OpenCvGrabber, capture_session, frame_quality
+
+    dev = int(a.device) if str(a.device).isdigit() else a.device
+    grabber = OpenCvGrabber(dev, a.width, a.height, a.exposure)
+    try:
+        if a.preview:
+            _print(frame_quality(grabber.grab()))
+            return
+        rows = capture_session(grabber.grab, a.out, a.n, prefix=a.prefix, interval_s=a.interval, station=a.station,
+                               operator=a.operator, on_frame=lambda s, q: print(s, "warnings:", q["warnings"] or "-"))
+    finally:
+        grabber.close()
+    print(f"captured {len(rows)} frames -> {Path(a.out) / 'images'} (manifest + capture_log.jsonl)")
+
+
+def _cmd_fai(a):
+    from .fai import render_fai
+
+    gage = json.loads(Path(a.gage).read_text(encoding="utf-8")) if a.gage else None
+    with _open_db(_db_path(a.db)) as db:
+        doc = render_fai(db, a.serial, spec=_load_spec(a.spec) if a.spec else None, gage=gage,
+                         prepared_by=a.by or "", customer=a.customer or "", drawing_no=a.drawing or "")
+    if a.out:
+        Path(a.out).write_text(doc, encoding="utf-8")
+        print(f"wrote {a.out}")
+    else:
+        print(doc)
+
+
+def _cmd_spec_approve(a):
+    from .db import InspectionDB
+
+    spec = _load_spec(a.spec)
+    prev = PartSpec.from_json(a.previous) if a.previous else None
+    with InspectionDB(_db_path(a.db)) as db:
+        if a.list:
+            _print(db.spec_approvals())
+            return
+        _print(db.approve_spec(spec, a.by, a.note, prev))
+
+
+def _cmd_rotate(a):
+    with _open_db(_db_path(a.db)) as db:
+        if a.export_only:
+            _print(db.export_archive(a.archive_dir))
+            return
+        try:
+            _print(db.rotate(a.archive_dir, a.by))
+        except ValueError as exc:
+            sys.exit(f"error: {exc}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     from .sampling import AQLS, INSPECTION_LEVELS
     from .spc import SUBGROUP_SIZES
@@ -412,6 +479,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--truth", help="ground_truth.csv: keep only PASS parts with no defect")
     p.add_argument("--limit", type=int); p.add_argument("--coreset", type=int, default=4000)
     p.add_argument("--k", type=int, default=1); p.add_argument("--threshold-sigma", type=float, default=5.0)
+    p.add_argument("--backend", default="handcrafted", choices=["handcrafted", "cnn"], help="cnn needs qinspect[cnn]")
     p.add_argument("--seed", type=int, default=0); p.add_argument("--spec"); p.set_defaults(fn=_cmd_train_anomaly)
 
     p = sub.add_parser("anomaly-eval", help="evaluate on an MVTec-style dataset folder")
@@ -443,7 +511,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("serve", help="REST API (FastAPI/uvicorn)")
     add_db(p); p.add_argument("--host", default="0.0.0.0"); p.add_argument("--port", type=int, default=8000)
-    p.add_argument("--spec"); p.add_argument("--model"); p.add_argument("--api-key", help="require X-API-Key on writes")
+    p.add_argument("--spec"); p.add_argument("--model"); p.add_argument("--api-key", help="single admin key for all writes")
+    p.add_argument("--api-keys", help="role keys 'k1:inspector,k2:quality,k3:auditor'")
     p.add_argument("--image-dir"); p.set_defaults(fn=_cmd_serve)
 
     p = sub.add_parser("dashboard", help="Streamlit dashboard (shows each lot against the spec it was inspected with)")
@@ -480,6 +549,31 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int); p.add_argument("--decision", choices=["ACCEPT", "REJECT", "HOLD"], help="override")
     p.add_argument("--note"); p.set_defaults(fn=_cmd_lot_close)
 
+    p = sub.add_parser("anomaly-compare", help="handcrafted vs CNN embedding on an MVTec-style dataset")
+    p.add_argument("--dataset", required=True); p.add_argument("--size", type=int, default=256)
+    p.add_argument("--limit", type=int, default=0); p.add_argument("--coreset", type=int, default=2000)
+    p.add_argument("--seed", type=int, default=0); p.set_defaults(fn=_cmd_anomaly_compare)
+
+    p = sub.add_parser("capture", help="grab frames from a camera into the canonical layout (qinspect[capture])")
+    p.add_argument("--device", default="0"); p.add_argument("--out", default="data/capture"); p.add_argument("--n", type=int, default=1)
+    p.add_argument("--prefix", default="CAP"); p.add_argument("--interval", type=float, default=0.0)
+    p.add_argument("--width", type=int); p.add_argument("--height", type=int); p.add_argument("--exposure", type=float)
+    p.add_argument("--station"); p.add_argument("--operator"); p.add_argument("--preview", action="store_true", help="print a frame quality report only")
+    p.set_defaults(fn=_cmd_capture)
+
+    p = sub.add_parser("fai", help="first-article inspection report (AS9102 form structure) for one serial")
+    add_db(p); p.add_argument("--serial", required=True); p.add_argument("--spec"); p.add_argument("--gage")
+    p.add_argument("--by"); p.add_argument("--customer"); p.add_argument("--drawing"); p.add_argument("--out"); p.set_defaults(fn=_cmd_fai)
+
+    p = sub.add_parser("spec-approve", help="record approval of a spec revision (change control)")
+    add_db(p); p.add_argument("--spec"); p.add_argument("--previous", help="previous spec json (links revisions)")
+    p.add_argument("--by"); p.add_argument("--note"); p.add_argument("--list", action="store_true"); p.set_defaults(fn=_cmd_spec_approve)
+
+    p = sub.add_parser("rotate", help="archive the database and start a new chain whose genesis is the current head")
+    add_db(p); p.add_argument("--archive-dir", required=True); p.add_argument("--by", default="qa")
+    p.add_argument("--export-only", action="store_true", help="only write the CSV/JSON export, keep the database")
+    p.set_defaults(fn=_cmd_rotate)
+
     p = sub.add_parser("disposition", help="record an NG disposition (rework/scrap/use_as_is/mrb/reinspect) or list open NG")
     add_db(p); p.add_argument("--inspection-id", type=int); p.add_argument("--decision", choices=["rework", "scrap", "use_as_is", "mrb", "reinspect"])
     p.add_argument("--by"); p.add_argument("--note"); p.add_argument("--mrb-ref")
@@ -491,6 +585,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.cmd == "disposition" and not args.list and (not args.decision or not args.by):
         sys.exit("error: --decision and --by are required")
+    if args.cmd == "spec-approve" and not args.list and not args.by:
+        sys.exit("error: --by is required")
     args.fn(args)
     return 0
 

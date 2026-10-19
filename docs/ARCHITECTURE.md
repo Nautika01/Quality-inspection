@@ -43,6 +43,8 @@ db.InspectionDB.add_inspection ─ BEGIN IMMEDIATE { ensure_lot(규격 바인딩
 | `calibrations` | 교정 기록: px/mm, 게이지, 작업자, 영상 해시 |
 | `events` | 알람·시스템 이벤트, 확인(ack) 필드 |
 | `anchors` | 체인 머리 고정(레코드 수·해시·시각) |
+| `meta` | `chain_genesis`(로테이션 시 이전 DB의 head), 이전 DB 경로·해시, 로테이션 기록 |
+| `spec_approvals` | 규격 개정 승인(해시·이전 해시·승인자·규격 JSON) |
 
 ## 감사 체인
 
@@ -68,13 +70,26 @@ record[0].prev = "000…0"
 
 ## 메시지 버스
 
-`InMemoryBus` / `MqttBus`가 같은 `publish(topic, payload) -> bool` 인터페이스. 브로커 연결 실패는 시작 시 `ConnectionError`로 즉시 드러나고, 실행 중 끊김은 paho 재연결 + `errors` 카운터. OPC UA가 필요하면 같은 인터페이스로 `OpcUaBus` 추가.
+`InMemoryBus` / `MqttBus` / `OpcUaBus`가 같은 `publish(topic, payload) -> bool` 인터페이스. 연결 실패는 시작 시 `ConnectionError`로 즉시 드러나고, 실행 중 오류는 `errors` 카운터(라인은 멈추지 않음). OPC UA는 `Objects/<root>/<station>/<kind>`(JSON)와 `Serial/Verdict/Reasons/OdMm/PocketMm/ConcentricityMm` 태그에 씁니다. 태그는 PLC가 미리 갖고 있어야 하며(익명 클라이언트는 보통 노드 생성 불가), URL은 `opc.tcp://host:port/endpoint?root=<object>&ns=<namespace-uri>`.
 
 ```
 qinspect/<station>/result    검사 1건 (InspectionResult.to_row + lot_id)
 qinspect/<station>/alarm     critical_defect | spc_violation | yield_drop | vision_error (+ event_id)
 qinspect/<station>/heartbeat
 ```
+
+## 체인 로테이션
+
+`rotate`: 체인 검증 → 모든 Lot 마감 확인 → 앵커 → SQLite 백업 + CSV/`chain.json` 내보내기 → 라이브 파일을 비운 뒤 `meta.chain_genesis = 이전 head`, `previous_db_sha256` 기록. 새 DB의 첫 레코드는 이전 head에 연결되므로 아카이브 N개가 하나의 체인을 이룹니다.
+
+## 인증 역할
+
+| 역할 | 허용 |
+|---|---|
+| inspector | `POST /inspect` |
+| quality | inspector + 처분, Lot 마감, 관리한계 동결, 알람 확인 |
+| auditor | `POST /audit/anchor` |
+| admin | 전부 (`QINSPECT_API_KEY` 단일 키는 admin) |
 
 ## 확장 포인트
 - 새 치수 특성: `PartSpec`에 `DimensionSpec` 추가 → `vision.measure_geometry` 측정 → `inspector.decide` 판정 → `line.CHARACTERISTICS`.

@@ -139,6 +139,22 @@ CREATE TABLE IF NOT EXISTS anchors (
     head TEXT NOT NULL,
     note TEXT
 );
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS spec_approvals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    spec_hash TEXT NOT NULL,
+    part_number TEXT,
+    revision TEXT,
+    previous_hash TEXT,
+    approved_by TEXT NOT NULL,
+    approved_at TEXT NOT NULL,
+    note TEXT,
+    spec_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_spec_appr ON spec_approvals(spec_hash);
 """
 
 GENESIS = "0" * 64
@@ -224,8 +240,10 @@ _MIGRATION_COLUMNS = {
 
 
 class InspectionDB:
-    def __init__(self, path: str | Path = "qinspect.db", *, create: bool = True, timeout: float = 30.0):
+    def __init__(self, path: str | Path = "qinspect.db", *, create: bool = True, timeout: float = 30.0,
+                 require_approved_spec: bool = False):
         self.path = str(path)
+        self.require_approved_spec = require_approved_spec
         if not create and self.path != ":memory:" and not Path(self.path).exists():
             raise FileNotFoundError(f"database not found: {self.path}")
         self._lock = threading.RLock()
@@ -284,6 +302,22 @@ class InspectionDB:
         with self._lock:
             self.conn.close()
 
+    # -- meta / chain genesis ------------------------------------------------
+    def get_meta(self, key: str, default: str | None = None) -> str | None:
+        row = self._q1("SELECT value FROM meta WHERE key=?", (key,))
+        return row["value"] if row else default
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self._lock:
+            self.conn.execute("INSERT INTO meta(key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                              (key, value))
+
+    @property
+    def genesis(self) -> str:
+        """Hash the first record chains to: all zeros for a fresh database, or the head of the
+        database this one was rotated from (`qinspect rotate`), so archives stay linked."""
+        return self.get_meta("chain_genesis", GENESIS)
+
     def _q(self, sql: str, args=()) -> list[sqlite3.Row]:
         """Locked read: one connection is shared by several threads (API threadpool, dashboard)."""
         with self._lock:
@@ -308,6 +342,8 @@ class InspectionDB:
             row = self.conn.execute("SELECT spec_hash, status FROM lots WHERE lot_id=?", (lot_id,)).fetchone()
             sh = spec_hash(spec)
             if row is None:
+                if self.require_approved_spec and not self.spec_approved(sh):
+                    raise ValueError(f"spec {sh} is not approved (record it with `qinspect spec-approve`)")
                 self.conn.execute(
                     "INSERT INTO lots(lot_id, part_number, spec_hash, spec_json, created_at) VALUES (?,?,?,?,?)",
                     (lot_id, spec.part_number, sh, json.dumps(spec.to_dict(), ensure_ascii=False), utc_now()),
@@ -368,7 +404,7 @@ class InspectionDB:
                     if prev_row["serial"] != res.serial:
                         raise ValueError("reinspection must reference the same serial")
                 row = self.conn.execute("SELECT record_hash FROM inspections ORDER BY id DESC LIMIT 1").fetchone()
-                prev = row[0] if row else GENESIS
+                prev = row[0] if row else self.genesis
                 rh = _hash(prev, canon)
                 cur = self.conn.execute(
                     """INSERT INTO inspections(serial, lot_id, inspected_at, verdict, reasons, od_mm, pocket_mm,
@@ -568,6 +604,96 @@ class InspectionDB:
     def calibrations(self, limit: int = 50) -> list[dict]:
         return [dict(r) for r in self._q("SELECT * FROM calibrations ORDER BY id DESC LIMIT ?", (limit,))][::-1]
 
+    # -- spec change control -------------------------------------------------
+    def approve_spec(self, spec: PartSpec, approved_by: str, note: str | None = None,
+                     previous: PartSpec | None = None) -> dict:
+        if not approved_by:
+            raise ValueError("approved_by is required")
+        sh = spec_hash(spec)
+        with self._lock:
+            cur = self.conn.execute(
+                """INSERT INTO spec_approvals(spec_hash, part_number, revision, previous_hash, approved_by, approved_at, note, spec_json)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (sh, spec.part_number, spec.revision, spec_hash(previous) if previous else None, approved_by, utc_now(), note,
+                 json.dumps(spec.to_dict(), ensure_ascii=False)))
+            return {"id": int(cur.lastrowid), "spec_hash": sh, "approved_by": approved_by}
+
+    def spec_approved(self, sh: str) -> bool:
+        return self._q1("SELECT 1 FROM spec_approvals WHERE spec_hash=?", (sh,)) is not None
+
+    def spec_approvals(self) -> list[dict]:
+        return [dict(r) for r in self._q("SELECT id, spec_hash, part_number, revision, previous_hash, approved_by, approved_at, note FROM spec_approvals ORDER BY id")]
+
+    # -- archive / rotation ----------------------------------------------------
+    def export_archive(self, out_dir: str | Path) -> dict:
+        """Dump every table to CSV plus `chain.json` (genesis, head, anchors) for long-term retention."""
+        import csv
+
+        out = Path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        counts = {}
+        with self._lock:
+            for table in ("lots", "inspections", "defects", "events", "dispositions", "lot_dispositions",
+                          "control_limits", "calibrations", "anchors", "spec_approvals", "meta"):
+                rows = self.conn.execute(f"SELECT * FROM {table}").fetchall()
+                counts[table] = len(rows)
+                with (out / f"{table}.csv").open("w", newline="", encoding="utf-8") as fh:
+                    if rows:
+                        w = csv.DictWriter(fh, fieldnames=rows[0].keys())
+                        w.writeheader()
+                        w.writerows(dict(r) for r in rows)
+            chain = self.verify_chain()
+        (out / "chain.json").write_text(json.dumps({"exported_at": utc_now(), "source": self.path, "chain": chain,
+                                                   "counts": counts}, indent=2), encoding="utf-8")
+        return {"dir": str(out), "counts": counts, "chain": chain}
+
+    def rotate(self, archive_dir: str | Path, by: str) -> dict:
+        """Close the current chain and start a new database file whose genesis is this head.
+
+        The old file is copied (sqlite backup) into `archive_dir` together with a CSV export;
+        the live file is replaced by an empty database carrying `chain_genesis` = old head
+        and `previous_db` = sha256 of the archived file. Refuses when the chain is broken or
+        a lot is still open.
+        """
+        chain = self.verify_chain()
+        if not chain["ok"]:
+            raise ValueError("audit chain is not intact; refusing to rotate")
+        open_lots = [l["lot_id"] for l in self.lots() if l["status"] != "closed" and l["n"]]
+        if open_lots:
+            raise ValueError(f"close these lots before rotating: {open_lots}")
+        if self.path == ":memory:":
+            raise ValueError("cannot rotate an in-memory database")
+        archive_dir = Path(archive_dir)
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        stamp = utc_now().replace(":", "").replace("-", "")
+        with self._lock:
+            self.anchor_head(f"rotate by {by}")
+            self.set_meta("rotated_at", utc_now())
+            self.set_meta("rotated_by", by)
+            backup_path = archive_dir / f"qinspect-{stamp}.db"
+            dst = sqlite3.connect(backup_path)
+            self.conn.backup(dst)
+            dst.close()
+            export = self.export_archive(archive_dir / f"qinspect-{stamp}")
+            head = self.verify_chain()["head"]
+            digest = hashlib.sha256(backup_path.read_bytes()).hexdigest()
+            self.conn.close()
+            for suffix in ("", "-wal", "-shm"):
+                f = Path(self.path + suffix)
+                if f.exists():
+                    f.unlink()
+            self.conn = sqlite3.connect(self.path, check_same_thread=False, timeout=30.0, isolation_level=None)
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA foreign_keys=ON")
+            self._open_schema()
+            self.set_meta("chain_genesis", head)
+            self.set_meta("previous_db", str(backup_path))
+            self.set_meta("previous_db_sha256", digest)
+            self.set_meta("rotated_from_head", head)
+        return {"archived_db": str(backup_path), "archived_sha256": digest, "export": export["dir"],
+                "new_genesis": head}
+
     # -- events / audit -----------------------------------------------------
     def add_event(self, kind: str, payload: dict, lot_id: str | None = None, ts: str | None = None) -> int:
         with self._lock:
@@ -634,7 +760,7 @@ class InspectionDB:
             by_insp.setdefault(d["inspection_id"], []).append(
                 {"kind": d["kind"], "grade": d["grade"], "length_mm": d["length_mm"], "area_px": d["area_px"],
                  "bbox": [d["x0"], d["y0"], d["x1"], d["y1"]]})
-        prev, n = GENESIS, 0
+        prev, n = self.genesis, 0
         heads: dict[int, str] = {}
         keys = rows[0].keys() if rows else []
         for r in rows:
@@ -647,10 +773,10 @@ class InspectionDB:
             prev = r["record_hash"]
             n += 1
             heads[n] = prev
-        out = {"ok": True, "checked": n, "head": prev}
+        out = {"ok": True, "checked": n, "head": prev, "genesis": self.genesis}
         for a in anchors:  # every anchor must still be a prefix of the chain
             an, ah = a["n_records"], a["head"]
-            if an > n or heads.get(an, GENESIS if an == 0 else None) != ah:
+            if an > n or heads.get(an, self.genesis if an == 0 else None) != ah:
                 out.update(ok=False, anchor_mismatch={"anchor_id": a["id"], "anchored_n": an, "anchored_head": ah, "current_n": n},
                            note="records after an anchor were removed or the anchored prefix changed")
                 return out

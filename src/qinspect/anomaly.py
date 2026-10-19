@@ -48,9 +48,78 @@ def _part_frame(img: np.ndarray, size: int = 192, has_pocket: bool = True) -> tu
     return canon, face
 
 
-def patch_features(img: np.ndarray, size: int = 192, has_pocket: bool = True) -> tuple[np.ndarray, np.ndarray, tuple[int, int]]:
-    """Return (features [N, D], valid-patch mask [N], grid shape) for one image."""
+BACKENDS = ("handcrafted", "cnn")
+
+
+def cnn_available() -> bool:
+    try:
+        import torch  # noqa: F401
+        import torchvision  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+_CNN = {}
+
+
+def _cnn_embedder():
+    """ResNet-18 layer2 feature map (stride 8) as a PatchCore-style backbone. Pretrained weights
+    are loaded from QINSPECT_CNN_WEIGHTS (offline) or torchvision's download; without either,
+    random weights are used with a warning (still a usable but weaker embedding)."""
+    if "model" in _CNN:
+        return _CNN["model"]
+    import os
+    import warnings
+
+    import torch
+    import torchvision
+
+    weights_path = os.environ.get("QINSPECT_CNN_WEIGHTS")
+    net = torchvision.models.resnet18(weights=None)
+    if weights_path:
+        net.load_state_dict(torch.load(weights_path, map_location="cpu"))
+    else:
+        try:
+            net = torchvision.models.resnet18(weights=torchvision.models.ResNet18_Weights.IMAGENET1K_V1)
+        except Exception as exc:  # noqa: BLE001 - offline
+            warnings.warn(f"cnn backend: pretrained weights unavailable ({exc}); using random init", stacklevel=2)
+    net.eval()
+    trunk = torch.nn.Sequential(net.conv1, net.bn1, net.relu, net.maxpool, net.layer1, net.layer2)
+    _CNN["model"] = trunk
+    return trunk
+
+
+def _cnn_patch_features(canon: np.ndarray, face: np.ndarray, size: int) -> tuple[np.ndarray, np.ndarray, tuple[int, int]]:
+    import torch
+
+    trunk = _cnn_embedder()
+    x = torch.from_numpy((canon / 255.0).astype(np.float32))[None, None]
+    x = (x.repeat(1, 3, 1, 1) - 0.45) / 0.225
+    with torch.no_grad():
+        fm = trunk(x)[0]  # [C, h, w], stride 8
+        fm = torch.nn.functional.avg_pool2d(fm[None], 3, stride=1, padding=1)[0]  # local aggregation as in PatchCore
+    C, h, w = fm.shape
+    F = fm.permute(1, 2, 0).reshape(h * w, C).numpy()
+    # a patch is valid when its receptive-field centre cell is fully on the face
+    cell = size // h
+    fwin = face[: h * cell, : w * cell].reshape(h, cell, w, cell).all(axis=(1, 3))
+    return F, fwin.reshape(-1), (h, w)
+
+
+def patch_features(img: np.ndarray, size: int = 192, has_pocket: bool = True,
+                   backend: str = "handcrafted") -> tuple[np.ndarray, np.ndarray, tuple[int, int]]:
+    """Return (features [N, D], valid-patch mask [N], grid shape) for one image.
+
+    backend "handcrafted" (numpy/scipy only) or "cnn" (torchvision ResNet-18 layer2).
+    """
+    if backend not in BACKENDS:
+        raise ValueError(f"backend must be one of {BACKENDS}")
     canon, face = _part_frame(img, size, has_pocket)
+    if backend == "cnn":
+        if not cnn_available():
+            raise RuntimeError("cnn backend needs `pip install torch torchvision` (qinspect[cnn])")
+        return _cnn_patch_features(canon, face, size)
     # remove slow illumination so features describe texture, not lighting
     flat = canon - ndi.gaussian_filter(canon, 8)
     gx = ndi.sobel(flat, axis=1)
@@ -105,6 +174,7 @@ class AnomalyModel:
     k: int = 1
     size: int = 192
     has_pocket: bool = True
+    backend: str = "handcrafted"
 
     def __post_init__(self):
         if self.k < 1 or self.k > len(self.bank):
@@ -115,7 +185,7 @@ class AnomalyModel:
 
     def score_map(self, img: np.ndarray) -> tuple[float, np.ndarray]:
         """Image score and patch-level anomaly map. Raises VisionError if the part is not found."""
-        F, valid, grid = patch_features(img, self.size, self.has_pocket)
+        F, valid, grid = patch_features(img, self.size, self.has_pocket, self.backend)
         Z = (F - self.mu) / self.sd
         if valid.sum() < 3:
             raise VisionError("degenerate_geometry", "fewer than 3 face patches")
@@ -143,7 +213,7 @@ class AnomalyModel:
             np.savez_compressed(fh, bank=self.bank.astype(np.float32), mu=self.mu.astype(np.float64),
                                 sd=self.sd.astype(np.float64), threshold=float(self.threshold),
                                 train_scores=self.train_scores.astype(np.float64), k=int(self.k),
-                                size=int(self.size), has_pocket=bool(self.has_pocket),
+                                size=int(self.size), has_pocket=bool(self.has_pocket), backend=str(self.backend),
                                 meta=json.dumps(meta or {}))
         return model_hash(path)
 
@@ -151,8 +221,9 @@ class AnomalyModel:
     def load(cls, path: str | Path) -> "AnomalyModel":
         z = np.load(path, allow_pickle=False)
         has_pocket = bool(z["has_pocket"]) if "has_pocket" in z.files else True
+        backend = str(z["backend"]) if "backend" in z.files else "handcrafted"
         return cls(z["bank"], z["mu"], z["sd"], float(z["threshold"]), z["train_scores"], int(z["k"]),
-                   int(z["size"]), has_pocket)
+                   int(z["size"]), has_pocket, backend)
 
 
 def model_file(path: str | Path) -> Path:
@@ -170,7 +241,8 @@ RECOMMENDED_TRAIN_IMAGES = 10
 
 
 def train(good_images: list[np.ndarray], *, coreset: int = 4000, k: int = 1, seed: int = 0,
-          threshold_sigma: float = 5.0, has_pocket: bool = True, names: list[str] | None = None) -> AnomalyModel:
+          threshold_sigma: float = 5.0, has_pocket: bool = True, names: list[str] | None = None,
+          backend: str = "handcrafted") -> AnomalyModel:
     """Fit the memory bank on good images.
 
     Threshold = median + `threshold_sigma` * spread of 2-fold held-out scores on the training
@@ -205,7 +277,7 @@ def train(good_images: list[np.ndarray], *, coreset: int = 4000, k: int = 1, see
     per_image = []
     for im, nm in uniq:
         try:
-            F, valid, _ = patch_features(im, has_pocket=has_pocket)
+            F, valid, _ = patch_features(im, has_pocket=has_pocket, backend=backend)
         except VisionError as exc:
             raise ValueError(f"cannot use {nm} for training: {exc}") from exc
         if valid.sum() < 3:
@@ -233,7 +305,7 @@ def train(good_images: list[np.ndarray], *, coreset: int = 4000, k: int = 1, see
     allZ = np.concatenate(Z)
     bank = allZ[_greedy_coreset(allZ, coreset, rng)]
     return AnomalyModel(bank=bank, mu=mu, sd=sd, threshold=thr, train_scores=scores, k=min(k, len(bank)),
-                        has_pocket=has_pocket)
+                        has_pocket=has_pocket, backend=backend)
 
 
 def auroc(scores_neg: np.ndarray, scores_pos: np.ndarray) -> float:
@@ -255,3 +327,30 @@ def auroc(scores_neg: np.ndarray, scores_pos: np.ndarray) -> float:
         i = j + 1
     r_pos = ranks[len(neg) :].sum()
     return float((r_pos - len(pos) * (len(pos) + 1) / 2) / (len(neg) * len(pos)))
+
+
+def compare_backends(good: list[np.ndarray], test_good: list[np.ndarray], test_bad: dict[str, list[np.ndarray]],
+                     *, coreset: int = 2000, seed: int = 0, backends: tuple[str, ...] = BACKENDS) -> dict:
+    """Train each backend on the same images and report AUROC / FP rate / timings / model size."""
+    import time
+
+    out = {}
+    for b in backends:
+        if b == "cnn" and not cnn_available():
+            out[b] = {"skipped": "torch/torchvision not installed"}
+            continue
+        t0 = time.time()
+        m = train(good, coreset=coreset, seed=seed, backend=b)
+        t_train = time.time() - t0
+        t0 = time.time()
+        g = np.array([m.score(im) for im in test_good])
+        t_score = (time.time() - t0) / max(len(test_good), 1)
+        per = {}
+        for cls, ims in test_bad.items():
+            sc = np.array([m.score(im) for im in ims])
+            per[cls] = {"auroc": auroc(g, sc), "detection_rate": float((sc > m.threshold).mean()) if len(sc) else None}
+        out[b] = {"n_train": len(good), "feature_dim": int(m.bank.shape[1]), "bank": int(m.bank.shape[0]),
+                  "train_s": round(t_train, 2), "score_ms_per_image": round(1000 * t_score, 1),
+                  "good_fp_rate": float((g > m.threshold).mean()) if len(g) else None, "per_class": per,
+                  "model_bytes": int(m.bank.astype(np.float32).nbytes)}
+    return out

@@ -3,8 +3,11 @@
     qinspect serve --db /data/qinspect.db            (or: uvicorn --factory qinspect.api:create_app)
     QINSPECT_DB, QINSPECT_SPEC, QINSPECT_MODEL, QINSPECT_API_KEY, QINSPECT_IMAGE_DIR, QINSPECT_MAX_UPLOAD_MB
 
-Writes (`POST`) require the `X-API-Key` header when QINSPECT_API_KEY is set; reads are
-open on the plant network. Every record carries the station and operator supplied by the
+Writes (`POST`) require the `X-API-Key` header when keys are configured; reads are open on
+the plant network. Roles: QINSPECT_API_KEY = one admin key (every write), or
+QINSPECT_API_KEYS="key1:inspector,key2:quality,key3:auditor" where
+inspector -> /inspect, quality -> inspector + dispositions / lot close / freeze / ack,
+auditor -> /audit/anchor, admin -> everything. Every record carries the station and operator supplied by the
 caller, and the SHA-256 of the uploaded image (stored under QINSPECT_IMAGE_DIR for NG / ERROR
 frames when set).
 """
@@ -71,8 +74,29 @@ class AckIn(BaseModel):
     note: str | None = Field(default=None, max_length=500)
 
 
+ROLES = {"inspector": {"inspect"}, "quality": {"inspect", "quality"}, "auditor": {"audit"},
+         "admin": {"inspect", "quality", "audit"}}
+
+
+def parse_api_keys(single: str | None, multi: str | None) -> dict[str, str]:
+    """{key: role} from QINSPECT_API_KEY (admin) and/or QINSPECT_API_KEYS='k:role,...'."""
+    keys: dict[str, str] = {}
+    if single:
+        keys[single] = "admin"
+    for item in (multi or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        key, _, role = item.partition(":")
+        role = role or "admin"
+        if role not in ROLES:
+            raise ValueError(f"unknown API role {role!r}; use one of {sorted(ROLES)}")
+        keys[key.strip()] = role
+    return keys
+
+
 def create_app(db_path: str | None = None, spec: PartSpec | None = None, model_path: str | None = None,
-               api_key: str | None = None, image_dir: str | None = None) -> FastAPI:
+               api_key: str | None = None, image_dir: str | None = None, api_keys: dict[str, str] | None = None) -> FastAPI:
     db_path = db_path or os.environ.get("QINSPECT_DB", "qinspect.db")
     if spec is None:
         sp = os.environ.get("QINSPECT_SPEC")
@@ -80,7 +104,9 @@ def create_app(db_path: str | None = None, spec: PartSpec | None = None, model_p
     model_path = model_path or os.environ.get("QINSPECT_MODEL")
     model = AnomalyModel.load(model_path) if model_path else None
     mh = model_hash(model_path) if model_path else None
-    api_key = api_key if api_key is not None else os.environ.get("QINSPECT_API_KEY")
+    if api_keys is None:
+        api_keys = parse_api_keys(api_key if api_key is not None else os.environ.get("QINSPECT_API_KEY"),
+                                  os.environ.get("QINSPECT_API_KEYS"))
     image_dir = image_dir or os.environ.get("QINSPECT_IMAGE_DIR")
     max_upload = int(float(os.environ.get("QINSPECT_MAX_UPLOAD_MB", "20")) * 1024 * 1024)
 
@@ -89,9 +115,21 @@ def create_app(db_path: str | None = None, spec: PartSpec | None = None, model_p
     app.state.spec = spec
     app.state.model = model
 
-    def require_key(x_api_key: str | None = Header(default=None)):
-        if api_key and not (x_api_key and secrets.compare_digest(x_api_key, api_key)):
-            raise HTTPException(401, "missing or invalid X-API-Key")
+    def require(permission: str):
+        def dep(x_api_key: str | None = Header(default=None)):
+            if not api_keys:
+                return  # open mode (no keys configured)
+            role = None
+            for key, r in api_keys.items():
+                if x_api_key and secrets.compare_digest(x_api_key, key):
+                    role = r
+            if role is None:
+                raise HTTPException(401, "missing or invalid X-API-Key")
+            if permission not in ROLES[role]:
+                raise HTTPException(403, f"role {role!r} may not {permission}")
+        return dep
+
+    require_inspect, require_quality, require_audit = require("inspect"), require("quality"), require("audit")
 
     def get_db() -> InspectionDB:
         return app.state.db
@@ -99,13 +137,13 @@ def create_app(db_path: str | None = None, spec: PartSpec | None = None, model_p
     @app.get("/health")
     def health():
         return {"status": "ok", "version": __version__, "spec_hash": spec_hash(spec), "model_hash": mh,
-                "auth": bool(api_key)}
+                "auth": bool(api_keys), "roles": sorted(set(api_keys.values()))}
 
     @app.get("/spec")
     def get_spec():
         return spec.to_dict()
 
-    @app.post("/inspect", dependencies=[Depends(require_key)])
+    @app.post("/inspect", dependencies=[Depends(require_inspect)])
     def inspect(file: UploadFile = File(...), lot_id: str = Form("LOT-API", min_length=1, max_length=64),
                 serial: str | None = Form(None, max_length=64), station: str = Form("api", max_length=64),
                 operator: str | None = Form(None, max_length=64), reinspection_of: int | None = Form(None)):
@@ -186,7 +224,7 @@ def create_app(db_path: str | None = None, spec: PartSpec | None = None, model_p
     def lot_open_ng(lot_id: str, db: InspectionDB = Depends(get_db)):
         return db.open_ng(lot_id)
 
-    @app.post("/lots/{lot_id}/close", dependencies=[Depends(require_key)])
+    @app.post("/lots/{lot_id}/close", dependencies=[Depends(require_quality)])
     def lot_close(lot_id: str, body: LotCloseIn, db: InspectionDB = Depends(get_db)):
         """Acceptance sampling on the lot's latest-per-serial results, then record the lot disposition."""
         if body.aql not in AQLS or body.level not in INSPECTION_LEVELS:
@@ -227,7 +265,7 @@ def create_app(db_path: str | None = None, spec: PartSpec | None = None, model_p
             raise HTTPException(404, "inspection not found")
         return row | {"dispositions": db.dispositions_for(inspection_id)}
 
-    @app.post("/inspections/{inspection_id}/disposition", dependencies=[Depends(require_key)])
+    @app.post("/inspections/{inspection_id}/disposition", dependencies=[Depends(require_quality)])
     def disposition(inspection_id: int, body: DispositionIn, db: InspectionDB = Depends(get_db)):
         try:
             did = db.add_disposition(inspection_id, body.decision, body.decided_by, body.note, body.mrb_ref)
@@ -240,7 +278,7 @@ def create_app(db_path: str | None = None, spec: PartSpec | None = None, model_p
                unacked: bool = False, db: InspectionDB = Depends(get_db)):
         return db.events(kind, limit, lot_id=lot_id, unacked_only=unacked)
 
-    @app.post("/events/{event_id}/ack", dependencies=[Depends(require_key)])
+    @app.post("/events/{event_id}/ack", dependencies=[Depends(require_quality)])
     def ack(event_id: int, body: AckIn, db: InspectionDB = Depends(get_db)):
         if not db.ack_event(event_id, body.by, body.note):
             raise HTTPException(404, "event not found or already acknowledged")
@@ -256,7 +294,7 @@ def create_app(db_path: str | None = None, spec: PartSpec | None = None, model_p
             part_number = lot_spec.part_number
         return db.active_limits(part_number or spec.part_number)
 
-    @app.post("/spc/limits/freeze", dependencies=[Depends(require_key)])
+    @app.post("/spc/limits/freeze", dependencies=[Depends(require_quality)])
     def spc_freeze(body: FreezeIn, lot_id: str = Query(...), db: InspectionDB = Depends(get_db)):
         """Freeze X-bar/R limits for a characteristic from a lot's Phase I data, filed under the lot's part."""
         if body.subgroup not in SUBGROUP_SIZES:
@@ -294,7 +332,7 @@ def create_app(db_path: str | None = None, spec: PartSpec | None = None, model_p
     def audit_verify(db: InspectionDB = Depends(get_db)):
         return db.verify_chain()
 
-    @app.post("/audit/anchor", dependencies=[Depends(require_key)])
+    @app.post("/audit/anchor", dependencies=[Depends(require_audit)])
     def audit_anchor(note: str | None = None, db: InspectionDB = Depends(get_db)):
         return db.anchor_head(note)
 

@@ -1,6 +1,6 @@
 services:
   api:
-    image: qinspect:0.3
+    image: qinspect:0.4
     build: .
     ports: ["8000:8000"]
     volumes: ["qinspect-data:/data"]
@@ -10,7 +10,7 @@ services:
       # QINSPECT_API_KEY: change-me      # require X-API-Key on POST endpoints
       # QINSPECT_SPEC: /data/spec.json
   dashboard:
-    image: qinspect:0.3
+    image: qinspect:0.4
     build: .
     command: ["qinspect", "dashboard", "--db", "/data/qinspect.db", "--port", "8501"]
     ports: ["8501:8501"]

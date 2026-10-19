@@ -32,7 +32,7 @@ def _res(serial, seed=0, **kw):
 
 def test_empty_db_verifies(tmp_path):
     with InspectionDB(tmp_path / "e.db") as db:
-        assert db.verify_chain() == {"ok": True, "checked": 0, "head": GENESIS}
+        assert db.verify_chain() == {"ok": True, "checked": 0, "head": GENESIS, "genesis": GENESIS}
 
 
 def test_audit_chain_detects_modification_and_deletions(tmp_path):

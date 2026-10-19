@@ -6,15 +6,15 @@
 
 ```bash
 # 인터넷 가능한 빌드 PC
-docker build -t qinspect:0.3 .                       # requirements-lock.txt 기준으로 설치
+docker build -t qinspect:0.4 .                       # requirements-lock.txt 기준으로 설치
 docker pull eclipse-mosquitto:2                      # (선택) MQTT 브로커 — compose의 mqtt 프로필이 쓰는 이미지
-docker save qinspect:0.3 eclipse-mosquitto:2 | gzip > qinspect-0.3-bundle.tar.gz   # 두 이미지를 한 번들로
-sha256sum qinspect-0.3-bundle.tar.gz > qinspect-0.3-bundle.tar.gz.sha256
+docker save qinspect:0.4 eclipse-mosquitto:2 | gzip > qinspect-0.4-bundle.tar.gz   # 두 이미지를 한 번들로
+sha256sum qinspect-0.4-bundle.tar.gz > qinspect-0.4-bundle.tar.gz.sha256
 
 # 폐쇄망 서버 (매체 반입 후)
-sha256sum -c qinspect-0.3-bundle.tar.gz.sha256
-docker load < qinspect-0.3-bundle.tar.gz
-docker compose up -d                 # api :8000, dashboard :8501  (compose는 image: qinspect:0.3 을 그대로 씀, pull 없음)
+sha256sum -c qinspect-0.4-bundle.tar.gz.sha256
+docker load < qinspect-0.4-bundle.tar.gz
+docker compose up -d                 # api :8000, dashboard :8501  (compose는 image: qinspect:0.4 을 그대로 씀, pull 없음)
 docker compose --profile mqtt up -d  # 브로커까지 띄울 때 (:1883)
 ```
 
@@ -50,6 +50,9 @@ qinspect serve --db /data/qinspect.db --api-key "$(cat /etc/qinspect/api.key)"
 | 교정 | 교대 시작 시 기준 디스크로 `qinspect calibrate --db ...` → `calibrations` 기록, px/mm 갱신 |
 | NG 종결 | `qinspect disposition --list` → 처분 기록; 재검사는 `reinspection_of`로 원 기록에 연결 |
 | Lot 출하 | `qinspect lot-close` (샘플링 + 치명결함 규칙 + 앵커) |
+| 규격 개정 | `qinspect spec-approve --spec new.json --previous old.json --by <승인자>`; API/라인은 `require_approved_spec`으로 미승인 규격 차단 가능 |
+| 초도품 | `qinspect fai --serial <SN> --gage gage.json --out FAI-<SN>.md` |
+| 보존 주기 종료 | `qinspect rotate --archive-dir /archive --by <담당>` → 아카이브 파일·`chain.json`을 WORM/외부 보관 |
 | 교대 리포트 | `qinspect export --since --until --tz Asia/Seoul` 또는 `GET /reports/shift` |
 | 백업 | SQLite 파일 복사(`sqlite3 db ".backup ..."`) + 체인 검증 |
 
@@ -60,7 +63,9 @@ qinspect serve --db /data/qinspect.db --api-key "$(cat /etc/qinspect/api.key)"
 | `QINSPECT_DB` | SQLite 경로 | `qinspect.db` |
 | `QINSPECT_SPEC` | 규격 JSON | 내장 예시 규격 |
 | `QINSPECT_MODEL` | 이상탐지 모델 `.npz` | 미사용 |
-| `QINSPECT_API_KEY` | 쓰기 API 보호 키 (`X-API-Key`) | 없음(모두 허용) |
+| `QINSPECT_API_KEY` | 관리자 키 (`X-API-Key`, 모든 쓰기) | 없음(모두 허용) |
+| `QINSPECT_API_KEYS` | 역할별 키 `k1:inspector,k2:quality,k3:auditor` | 없음 |
+| `QINSPECT_CNN_WEIGHTS` | ResNet-18 가중치 `.pth` (오프라인 CNN 백엔드) | torchvision 다운로드 시도 |
 | `QINSPECT_IMAGE_DIR` | NG/ERROR 프레임 증거 저장 폴더 | 저장 안 함 |
 | `QINSPECT_MAX_UPLOAD_MB` | `/inspect` 업로드 상한 | 20 |
 | `QINSPECT_TZ` | 대시보드·`export` 표시 시간대 (`--tz`가 우선) | `Asia/Seoul` |

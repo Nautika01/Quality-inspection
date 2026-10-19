@@ -1,8 +1,8 @@
 # Offline-capable image: build once on a connected machine, ship the image file to the closed network.
-#   docker build -t qinspect:0.3 .
-#   docker pull eclipse-mosquitto:2 && docker save qinspect:0.3 eclipse-mosquitto:2 | gzip > qinspect-0.3-bundle.tar.gz
-#   docker load < qinspect-0.3.tar.gz
-#   docker run -p 8000:8000 -v qinspect-data:/data qinspect:0.3
+#   docker build -t qinspect:0.4 .
+#   docker pull eclipse-mosquitto:2 && docker save qinspect:0.4 eclipse-mosquitto:2 | gzip > qinspect-0.4-bundle.tar.gz
+#   docker load < qinspect-0.4.tar.gz
+#   docker run -p 8000:8000 -v qinspect-data:/data qinspect:0.4
 # (a bind mount instead of the named volume must be writable by uid 1000: `chown -R 1000 /srv/qinspect`)
 FROM python:3.13-slim
 

@@ -14,7 +14,7 @@
 ```bash
 pip install -e ".[dev]"
 qinspect demo --out runs/demo        # 생성 → 이상탐지 학습 → 하이브리드 검사 → Gage R&R → 검사 기준서 (약 1분)
-pytest                               # 111개 테스트 (~70 s)
+pytest                               # 118개 테스트 (~80 s)
 ```
 
 `runs/demo/` 에 `results.csv`, `summary.json`, `spc_od_mm.png`, `spc_pocket_mm.png`, `overlays/`, `qinspect.db`(감사 체인·앵커 포함), `anomaly_model.npz`, `gage_rr.json`, `inspection_standard.md` 가 생깁니다.
@@ -58,8 +58,8 @@ pytest                               # 111개 테스트 (~70 s)
 | 3 딥러닝식 | `anomaly.py` | **PatchCore 방식 메모리뱅크**(양품만 학습, 중복 제거, 임계값 하한, 2-fold 보류 점수) + 하이브리드 규칙 |
 | 0 SPC | `spc.py` | X̄-R, Western Electric 1~4(시작 구간 포함), Phase I 25 subgroup, **동결 한계 평가**, EWMA, Cp/Cpk/Pp/Ppk |
 | 4 추적성 | `db.py` | Lot/Serial, 작업자, 영상 SHA-256, 규격·모델 해시, **원자적 SHA-256 해시 체인 + 앵커**, 재검사 연결, **처분(rework/scrap/use_as_is/mrb/reinspect)**, Lot 마감, 관리한계 동결, 교정 기록, 알람 확인 |
-| 4 연동 | `line.py` `api.py` `dashboard.py` | 라인 시뮬레이터(**MQTT** 또는 메모리 버스), **FastAPI REST**(인증·업로드 제한·동시성 안전), **Streamlit 대시보드** |
-| 5 표준 | `sampling.py` `specdoc.py` | **KS Q ISO 2859-1** 1회 샘플링(표 구조 인코딩, 상·하 화살표), **c=0** 정확 초기하, OC 곡선, 치명결함 Lot 불합격 규칙, **검사 기준서 자동 생성**(사유 코드·관리한계 포함) |
+| 4 연동 | `line.py` `api.py` `dashboard.py` `capture.py` | 라인 시뮬레이터(**MQTT / OPC UA** / 메모리 버스), **FastAPI REST**(역할별 키·업로드 제한·동시성 안전), **Streamlit 대시보드**, 카메라 캡처·품질 리포트 |
+| 5 표준 | `sampling.py` `specdoc.py` `fai.py` | **KS Q ISO 2859-1** 1회 샘플링(표 구조 인코딩, 상·하 화살표), **c=0** 정확 초기하, OC 곡선, 치명결함 Lot 불합격 규칙, **검사 기준서 자동 생성**, **AS9102 구조 FAI 보고서**, 규격 승인 기록, 체인 로테이션/아카이브 |
 | 5 배포 | `Dockerfile` `docker-compose.yml` `requirements-lock.txt` `scripts/` | 폐쇄망용 이미지(태그 고정)/휠하우스, 잠금 파일, 헬스체크, 비루트 실행 |
 
 ## 명령어
@@ -80,9 +80,16 @@ qinspect export --db qinspect.db --lot LOT-SIM --since 2026-10-14T00:00:00Z --un
 qinspect sampling --lot-size 1000 --aql 1.0 --defectives 1 --criticals 0   # 샘플링 계획 + 판정
 qinspect specdoc --gage gage.json --model anomaly_model.npz --db qinspect.db --out 검사기준서.md
 qinspect audit --db qinspect.db --anchor                                    # 해시 체인 검증 + 앵커 (깨지면 exit 2)
+qinspect capture --device 0 --n 40 --out data/pilot --prefix GOOD --preview    # 카메라 촬영 + 품질 리포트 (qinspect[capture])
 qinspect import --src ~/photos --dst data/real                              # 실제 사진 투입 (매니페스트 유지)
 qinspect calibrate --image gauge.png --diameter-mm 12.0 --out spec_real.json --db qinspect.db --gauge-id G-1
 qinspect anomaly-eval --dataset ~/mvtec/metal_nut                           # MVTec 형식 데이터셋 평가 (AUROC)
+qinspect anomaly-compare --dataset ~/mvtec/metal_nut                        # 수작업 특징 vs CNN(ResNet-18, qinspect[cnn]) 비교표
+qinspect fai --db qinspect.db --serial LOT-SIM-00001 --gage gage.json --out FAI.md   # AS9102 양식 구조 초도품 보고서
+qinspect spec-approve --spec spec_rev_b.json --previous spec_rev_a.json --by qa-lead  # 규격 개정 승인 기록
+qinspect rotate --db qinspect.db --archive-dir archive/ --by qa             # 체인 로테이션: 아카이브 + 새 DB(genesis = 이전 head)
+qinspect run-line --n 300 --db qinspect.db --bus "opc.tcp://plc:4840/?root=qinspect"   # OPC UA (qinspect[opcua])
+qinspect serve --db qinspect.db --api-keys "k1:inspector,k2:quality,k3:auditor"        # 역할별 API 키
 ```
 
 REST 예시:
@@ -103,13 +110,19 @@ curl http://localhost:8000/audit/verify
 - **감사 체인은 원자적입니다**: `BEGIN IMMEDIATE` 안에서 머리 해시를 읽고 삽입하며 `UNIQUE(prev_hash)`로 분기가 불가능합니다. NaN·-0.0·numpy 타입은 SQLite 저장 표현으로 정규화해 해시하므로 검증이 어긋나지 않습니다. 최신 행 삭제는 체인만으로 못 보므로 **앵커**(`anchors`, Lot 마감·배치·교대 종료 시)로 잡습니다.
 - **Lot은 규격 개정에 묶입니다**: 같은 Lot에 다른 `spec_hash`로 검사하면 거부됩니다. 대시보드·API는 Lot에 저장된 규격으로 한계·Cpk를 표시합니다.
 - **문서 = 코드**: 검사 기준서는 `PartSpec`·Gage 결과·동결 관리한계·사유 코드 카탈로그에서 생성됩니다.
-- **의존성 최소화**: 비전·이상탐지가 numpy/scipy만으로 동작해 폐쇄망 설치가 쉽습니다. CNN 백본은 `anomaly.patch_features` 한 함수만 바꾸면 됩니다.
+- **의존성 최소화**: 비전·이상탐지가 numpy/scipy만으로 동작해 폐쇄망 설치가 쉽습니다. CNN 임베딩(ResNet-18 layer2)은 `--backend cnn`으로 선택하며 torch가 있을 때만 활성화됩니다(`anomaly-compare`로 두 방식을 같은 데이터로 비교).
+- **역할별 인증**: inspector(검사 기록) / quality(처분·Lot 마감·관리한계·알람 확인) / auditor(앵커) / admin. 쓰기 엔드포인트마다 필요한 권한이 다릅니다.
+- **체인 로테이션**: 보존 주기가 끝나면 `rotate`가 DB를 아카이브(백업 + CSV + chain.json)하고 새 DB를 시작하되, 새 체인의 genesis가 이전 head라서 아카이브끼리 끊기지 않습니다.
+- **규격 변경 통제**: `spec-approve`로 개정 승인을 기록하고, `require_approved_spec`을 켜면 승인되지 않은 규격으로는 Lot을 열 수 없습니다.
+- **PLC 연동**: OPC UA 버스는 PLC가 미리 가진 태그(`<root>/<station>/Verdict, OdMm, ...`)에 씁니다. 태그가 없거나 권한이 없으면 카운트만 하고 라인은 멈추지 않습니다.
 
 ## 한계와 다음 단계
 
 - 모든 성능 수치는 **합성 데이터** 기준입니다. 실제 부품에서는 `detect_defects`의 임계값, 이상탐지 `threshold_sigma`, 등급 길이 기준 재조정과 MSA 재실시가 필요합니다. 결함 길이는 측정 extent 기준으로 정의 길이 대비 약 ±15 % 편차가 있습니다.
 - ISO 2859-1 표는 표의 구조(Ac 0,↑,1,2,3,5,7,10,14,21 대각선)로 인코딩했고 전 셀에서 생산자 위험 ≤ 20 %를 테스트로 확인했지만, 계약상 판정 전에는 원문 표준과 대조하세요. MIL-STD-1916 고유 표는 미구현이고 c=0 계산기로 대체했습니다.
-- API 인증은 단일 API 키입니다. 역할별 권한, mTLS, 앵커의 외부 타임스탬프 보관은 `docs/ROADMAP.md` 참고.
+- API 인증은 정적 키 + 역할입니다. mTLS·SSO, 앵커의 외부 타임스탬프 보관 자동화는 `docs/ROADMAP.md` 참고.
+- CNN 백엔드는 이 환경에서 torch를 설치할 수 없어 **실행 검증을 못 했습니다**(코드 경로는 있고, torch가 없으면 명확한 오류/skip). 사전학습 가중치는 `QINSPECT_CNN_WEIGHTS`로 오프라인 반입합니다.
+- AS9102 FAI 보고서는 양식 *구조*를 따르는 초안입니다. 조직의 공식 양식·서명·자재 인증은 별도 첨부.
 - SQLite + 단일 노드 구성입니다. 다중 스테이션이면 PostgreSQL + 메시지 큐로 바꾸는 것이 맞습니다(인터페이스는 `InspectionDB` 하나).
 
-자세한 구조는 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), 배포는 [docs/DEPLOY_OFFLINE.md](docs/DEPLOY_OFFLINE.md), 생성된 문서 예시는 [docs/inspection_standard_example.md](docs/inspection_standard_example.md).
+자세한 구조는 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), 배포는 [docs/DEPLOY_OFFLINE.md](docs/DEPLOY_OFFLINE.md), 실제 부품 촬영은 [docs/CAPTURE_GUIDE.md](docs/CAPTURE_GUIDE.md), 생성된 문서 예시는 [docs/inspection_standard_example.md](docs/inspection_standard_example.md).
